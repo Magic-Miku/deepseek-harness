@@ -110,20 +110,32 @@ jobs:
           New-Icon 150 150 (Join-Path $assets "Square150x150Logo.png")
           New-Icon 310 150 (Join-Path $assets "Wide310x150Logo.png")
 
-      - name: Sanitize package dir for MSIX
+      - name: Write our appx config
         if: steps.locate.outcome == 'success'
         shell: pwsh
         run: |
-          $dir = "${{ steps.locate.outputs.apdir }}"
-          $log = "b3-sanitize.log"
-          $bins = Get-ChildItem -Path $dir -Directory -Recurse -Force -Filter ".bin" -ErrorAction SilentlyContinue
-          "bin dirs: $($bins.Count)" | Out-File $log
-          $bins | ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
-          $links = Get-ChildItem -Path $dir -Recurse -Force -ErrorAction SilentlyContinue |
-            Where-Object { ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 }
-          "reparse: $($links.Count)" | Out-File $log -Append
-          $links | ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
-          Get-Content $log
+          $L = @(
+          'appId: com.deepseek.harness'
+          'productName: DeepSeek Harness'
+          'directories:'
+          '  output: dist-msix'
+          'win:'
+          '  target: appx'
+          'appx:'
+          '  identityName: 14714BE0.320850A8A419A'
+          '  publisher: CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD'
+          '  publisherDisplayName: Miku'
+          '  displayName: BlueFish'
+          '  applicationId: App'
+          '  capabilities:'
+          '    - runFullTrust'
+          '    - internetClient'
+          '  languages:'
+          '    - zh-CN'
+          '    - en-US'
+          )
+          [System.IO.File]::WriteAllText("electron-builder-appx.yml", ($L -join "`r`n"), (New-Object System.Text.UTF8Encoding $false))
+          Get-Content "electron-builder-appx.yml"
 
       - name: Resolve appx version
         id: ver
@@ -134,80 +146,28 @@ jobs:
           "version=$v" | Out-File -Append $env:GITHUB_OUTPUT
           Write-Host "APPX VERSION = $v"
 
-      - name: Write AppxManifest.xml
+      # ★ 改用 electron-builder 的 appx 打包器（成熟方案，Comfy 同款）
+      - name: Build appx (electron-builder prepackaged)
+        id: appx
         if: steps.locate.outcome == 'success'
-        shell: pwsh
+        continue-on-error: true
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          EP_DRAFT: 'false'
         run: |
           $dir = "${{ steps.locate.outputs.apdir }}"
           $ver = "${{ steps.ver.outputs.version }}"
-          $L = @(
-          '<?xml version="1.0" encoding="utf-8"?>'
-          '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap rescap">'
-          ('  <Identity Name="14714BE0.320850A8A419A" Publisher="CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" Version="' + $ver + '" />')
-          '  <Properties>'
-          '    <DisplayName>BlueFish</DisplayName>'
-          '    <PublisherDisplayName>Miku</PublisherDisplayName>'
-          '    <Logo>Assets\StoreLogo.png</Logo>'
-          '  </Properties>'
-          '  <Dependencies>'
-          '    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22621.0" />'
-          '  </Dependencies>'
-          '  <Resources>'
-          '    <Resource Language="zh-cn" />'
-          '    <Resource Language="en-us" />'
-          '  </Resources>'
-          '  <Applications>'
-          '    <Application Id="App" Executable="DeepSeek Harness.exe" EntryPoint="Windows.FullTrustApplication">'
-          '      <uap:VisualElements DisplayName="BlueFish" Description="BlueFish" BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png">'
-          '        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" />'
-          '      </uap:VisualElements>'
-          '    </Application>'
-          '  </Applications>'
-          '  <Capabilities>'
-          '    <rescap:Capability Name="runFullTrust" />'
-          '    <Capability Name="internetClient" />'
-          '  </Capabilities>'
-          '</Package>'
-          )
-          $xml = $L -join "`r`n"
-          [System.IO.File]::WriteAllText((Join-Path $dir "AppxManifest.xml"), $xml, (New-Object System.Text.UTF8Encoding $false))
-          Get-Content (Join-Path $dir "AppxManifest.xml") | Select-Object -First 5
-
-      # ★ 修正：用相对路径打包，避免 \\?\ 长前缀问题
-      - name: Pack appx with makeappx
-        id: pack
-        if: steps.locate.outcome == 'success'
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          $dir = "${{ steps.locate.outputs.apdir }}"
-          $kits = "C:\Program Files (x86)\Windows Kits\10\bin"
-          $mk = Get-ChildItem -Path $kits -Filter "makeappx.exe" -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match "x64" } |
-            Sort-Object FullName -Descending | Select-Object -First 1
-          if (-not $mk) { throw "makeappx not found" }
-
-          $parent = Split-Path $dir -Parent
-          $leaf   = Split-Path $dir -Leaf
-          Write-Host "parent=$parent  leaf=$leaf"
-
-          # 切到父目录，用相对路径打包（makeappx 就不会拼 \\?\ 前缀）
-          Push-Location $parent
-          & $mk.FullName pack /d $leaf /p "blue-fish.appx" /o *>&1 | Tee-Object -FilePath b4-makeappx.log
+          # 在 apps/desktop 上下文里跑（electron-builder 和其依赖都在那里）
+          Push-Location apps/desktop
+          pnpm exec electron-builder --win appx `
+            --prepackaged "$dir" `
+            -c.extraMetadata.version="$ver" `
+            --config electron-builder-appx.yml `
+            --publish never *>&1 | Tee-Object -FilePath "..\..\b4-appx.log"
           $code = $LASTEXITCODE
-          "EXIT=$code" | Tee-Object -Append -FilePath b4-makeappx.log
+          "EXIT=$code" | Tee-Object -Append -FilePath "..\..\b4-appx.log"
           Pop-Location
-
-          # 复制到 dist-msix 供上传
-          New-Item -ItemType Directory -Force -Path "dist-msix" | Out-Null
-          $src = Join-Path $parent "blue-fish.appx"
-          if (Test-Path $src) {
-            Copy-Item $src "dist-msix\blue-fish.appx" -Force
-            $sz = [math]::Round((Get-Item $src).Length/1MB,2)
-            Write-Host "APPX OK ($sz MB)"
-          } else {
-            Write-Host "APPX MISSING"
-          }
+          if ($code -ne 0) { Write-Host "APPX BUILD FAILED (exit $code)" }
 
       - name: Report artifacts
         if: always()
@@ -227,7 +187,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dsh-msix
-          path: dist-msix/*.appx
+          path: |
+            dist-msix/*.appx
+            dist-msix/*.msix
           if-no-files-found: warn
           retention-days: 30
 
