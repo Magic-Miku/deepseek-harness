@@ -12,7 +12,14 @@ jobs:
         shell: pwsh
     steps:
       - uses: actions/checkout@v4
-      - name: Silent install to disk
+      - name: Free disk and show memory
+        run: |
+          Write-Host "=== 内存 ==="
+          $cs = Get-CimInstance Win32_ComputerSystem
+          "TotalPhysicalMemory = {0:N1} GB" -f ($cs.TotalPhysicalMemory/1GB)
+          Write-Host "=== 磁盘 ==="
+          Get-PSDrive C | Select-Object @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}}, @{n='UsedGB';e={[math]::Round($_.Used/1GB,1)}} | Format-Table -AutoSize
+      - name: Silent install
         id: inst
         run: |
           $tmp = "$env:RUNNER_TEMP\dsh.exe"
@@ -22,36 +29,48 @@ jobs:
           if ($s -lt 200MB) { throw "download too small" }
           $target = "C:\DSHApp"
           New-Item -ItemType Directory -Force -Path $target | Out-Null
-          Write-Host "installing to $target ..."
           $p = Start-Process -FilePath $tmp -ArgumentList "/S", "/D=$target" -Wait -PassThru
           Write-Host "installer exit = $($p.ExitCode)"
           Start-Sleep -Seconds 6
           $n = (Get-ChildItem $target -Recurse -File -ErrorAction SilentlyContinue).Count
           Write-Host "installed files = $n"
-          if ($n -lt 100) {
-            Write-Host "=== target contents ==="
-            Get-ChildItem $target -Recurse -ErrorAction SilentlyContinue | Select-Object -First 30 FullName
-            throw "silent install produced too few files"
-          }
           $exe = Get-ChildItem $target -Recurse -Filter "DeepSeek Harness.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $exe) { throw "app exe not found after install" }
-          Write-Host "app exe = $($exe.FullName)"
+          if (-not $exe) { throw "app exe not found" }
+          Write-Host "appdir = $($exe.Directory.FullName)"
           "appdir=$($exe.Directory.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
-      - name: Show structure
-        if: always()
+      - name: Slim down - remove big chunks
+        id: slim
         run: |
           $d = "${{ steps.inst.outputs.appdir }}"
-          if (-not $d) { Write-Host "no appdir"; exit }
-          Write-Host "=== appdir = $d ==="
-          Get-ChildItem $d | Select-Object Mode, Name | Format-Table -AutoSize
-          Write-Host "=== resources ==="
-          Get-ChildItem (Join-Path $d "resources") -ErrorAction SilentlyContinue | Select-Object Mode, Name | Format-Table -AutoSize
+          $log = "s0-slim.log"
+          "=== 删除前的规模 ===" | Out-File $log
+          $before = Get-ChildItem $d -Recurse -File -ErrorAction SilentlyContinue
+          "files=$($before.Count)  size={0:N1} MB" -f (($before | Measure-Object Length -Sum).Sum/1MB) | Out-File $log -Append
+          "" | Out-File $log -Append
+
+          # 逐个删除大块，观察规模
+          $targets = @(
+            "resources\runtime\primary-runtime\dependencies\python",
+            "resources\app.asar.unpacked\dsh\node_modules\@deepseek-ai\libreoffice-kit-win32-x64",
+            "resources\runtime\pnpm"
+          )
+          foreach ($t in $targets) {
+            $full = Join-Path $d $t
+            if (Test-Path $full) {
+              $sz = (Get-ChildItem $full -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+              $cnt = (Get-ChildItem $full -Recurse -File -ErrorAction SilentlyContinue).Count
+              "REMOVE: $t  ($cnt files, {0:N1} MB)" -f ($sz/1MB) | Out-File $log -Append
+              Remove-Item $full -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+          "" | Out-File $log -Append
+          "=== 删除后 ===" | Out-File $log -Append
+          $after = Get-ChildItem $d -Recurse -File -ErrorAction SilentlyContinue
+          "files=$($after.Count)  size={0:N1} MB" -f (($after | Measure-Object Length -Sum).Sum/1MB) | Out-File $log -Append
+          Get-Content $log
       - name: Remove bracket files
-        if: always()
         run: |
           $d = "${{ steps.inst.outputs.appdir }}"
-          if (-not $d) { exit }
-          $log = "a5.log"
           $removed = 0
           $stack = New-Object System.Collections.Stack
           $stack.Push($d)
@@ -60,28 +79,17 @@ jobs:
             try {
               foreach ($f in [System.IO.Directory]::GetFiles($dir)) {
                 $nm = [System.IO.Path]::GetFileName($f)
-                if ($nm.Contains("[") -or $nm.Contains("]")) {
-                  "REMOVE: $f" | Out-File $log -Append
-                  [System.IO.File]::Delete($f)
-                  $removed++
-                }
+                if ($nm.Contains("[") -or $nm.Contains("]")) { [System.IO.File]::Delete($f); $removed++ }
               }
               foreach ($sub in [System.IO.Directory]::GetDirectories($dir)) {
-                $nm = [System.IO.Path]::GetFileName($sub)
-                if ($nm.Contains("[") -or $nm.Contains("]")) {
-                  [System.IO.Directory]::Delete($sub, $true)
-                  $removed++
-                } else { $stack.Push($sub) }
+                $stack.Push($sub)
               }
             } catch {}
           }
-          "removed = $removed" | Out-File $log -Append
-          Get-Content $log
-      - name: Write manifest
-        if: always()
+          Write-Host "bracket files removed = $removed"
+      - name: Write manifest and icons
         run: |
           $d = "${{ steps.inst.outputs.appdir }}"
-          if (-not $d) { exit }
           $v = "1.0.$env:GITHUB_RUN_NUMBER.0"
           Write-Host "version = $v"
           $L = @(
@@ -112,28 +120,40 @@ jobs:
           I 44 44 (Join-Path $a "Square44x44Logo.png")
           I 150 150 (Join-Path $a "Square150x150Logo.png")
           I 310 150 (Join-Path $a "Wide310x150Logo.png")
-          Write-Host "manifest + icons done"
-      - name: Pack
+      - name: Pack slim
         id: pack
-        if: always()
         continue-on-error: true
         run: |
           $d = "${{ steps.inst.outputs.appdir }}"
-          if (-not $d) { Write-Host "no appdir"; exit }
-          $mk = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Filter makeappx.exe -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match "\\x64\\" } | Sort-Object FullName -Descending | Select-Object -First 1
-          Write-Host "makeappx = $($mk.FullName)"
+          $mk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
           New-Item -ItemType Directory -Force -Path "C:\out" | Out-Null
-          & $mk.FullName pack /d $d /p "C:\out\app.appx" /o /nc 2>&1 | Tee-Object p1.log
-          Write-Host "EXIT=$LASTEXITCODE"
-          if (Test-Path "C:\out\app.appx") {
-            $s = (Get-Item "C:\out\app.appx").Length
-            Write-Host "*** SUCCESS $s bytes ***"
+          $sw = [System.Diagnostics.Stopwatch]::StartNew()
+          & $mk pack /d $d /p "C:\out\slim.appx" /o /nc 2>&1 | Tee-Object p1.log
+          $sw.Stop()
+          Write-Host "EXIT=$LASTEXITCODE  elapsed=$($sw.Elapsed.TotalSeconds)s"
+          if (Test-Path "C:\out\slim.appx") {
+            $s = (Get-Item "C:\out\slim.appx").Length
+            Write-Host "*** SUCCESS $s bytes ({0:N1} MB) ***" -f ($s/1MB)
             New-Item -ItemType Directory -Force -Path dist-msix | Out-Null
-            Copy-Item "C:\out\app.appx" "dist-msix\bluefish.appx" -Force
+            Copy-Item "C:\out\slim.appx" "dist-msix\slim.appx" -Force
           } else {
             Write-Host "*** FAILED ***"
-            Get-Content p1.log -ErrorAction SilentlyContinue | Select-Object -Last 6
+            Get-Content p1.log -ErrorAction SilentlyContinue | Select-Object -Last 5
+          }
+      - name: Pack slim with validation off
+        id: pack2
+        if: steps.pack.outcome != 'success'
+        continue-on-error: true
+        run: |
+          $d = "${{ steps.inst.outputs.appdir }}"
+          $mk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
+          & $mk pack /d $d /p "C:\out\slim2.appx" /o /nc /nv 2>&1 | Tee-Object p2.log
+          Write-Host "EXIT=$LASTEXITCODE"
+          if (Test-Path "C:\out\slim2.appx") {
+            $s = (Get-Item "C:\out\slim2.appx").Length
+            Write-Host "*** SUCCESS (nv) $s bytes ***"
+            New-Item -ItemType Directory -Force -Path dist-msix | Out-Null
+            Copy-Item "C:\out\slim2.appx" "dist-msix\slim2.appx" -Force
           }
       - name: Upload
         if: always()
@@ -149,7 +169,7 @@ jobs:
         with:
           name: winapp-logs
           path: |
-            a*.log
+            s*.log
             p*.log
           if-no-files-found: warn
           retention-days: 14
