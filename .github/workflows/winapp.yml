@@ -21,11 +21,10 @@ jobs:
         with:
           version: 11.28.5
           run_install: false
-      - name: Install electron-builder
+      - name: pnpm install
         run: |
           pnpm install --frozen-lockfile *>&1 | Tee-Object i1.log
           Write-Host "EXIT=$LASTEXITCODE"
-          pnpm exec electron-builder --version
       - name: Silent install app
         id: inst
         run: |
@@ -39,11 +38,18 @@ jobs:
           Start-Sleep -Seconds 6
           $exe = Get-ChildItem $target -Recurse -Filter "DeepSeek Harness.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $exe) { throw "app exe not found" }
-          Write-Host "appdir = $($exe.Directory.FullName)"
           $n = (Get-ChildItem $target -Recurse -File -ErrorAction SilentlyContinue).Count
-          Write-Host "files = $n (完整，不删任何文件)"
+          Write-Host "appdir = $($exe.Directory.FullName)   files = $n"
           "appdir=$($exe.Directory.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
-      - name: Write electron-builder config
+      - name: Check electron-builder availability
+        run: |
+          Write-Host "=== apps/desktop 下查找 electron-builder ==="
+          $eb = "apps\desktop\node_modules\.bin\electron-builder.cmd"
+          Write-Host "exists: $(Test-Path $eb)"
+          if (Test-Path $eb) { & $eb --version }
+          Write-Host "=== pnpm --filter 方式 ==="
+          pnpm --filter @deepseek-ai/dsh-desktop exec electron-builder --version 2>&1 | Select-Object -First 5
+      - name: Write config
         run: |
           $L = @(
           'appId: com.deepseek.harness'
@@ -75,8 +81,10 @@ jobs:
         run: |
           $d = "${{ steps.inst.outputs.appdir }}"
           New-Item -ItemType Directory -Force -Path "C:\ebout" | Out-Null
+          $eb = "apps\desktop\node_modules\.bin\electron-builder.cmd"
+          if (-not (Test-Path $eb)) { throw "electron-builder not found at $eb" }
           $sw = [System.Diagnostics.Stopwatch]::StartNew()
-          pnpm exec electron-builder --win appx --prepackaged $d --config eb-appx.yml --publish never *>&1 | Tee-Object p1.log
+          & $eb --win appx --prepackaged $d --config "$env:GITHUB_WORKSPACE\eb-appx.yml" --publish never *>&1 | Tee-Object p1.log
           $code = $LASTEXITCODE
           $sw.Stop()
           Write-Host "EXIT=$code  elapsed=$([math]::Round($sw.Elapsed.TotalSeconds))s"
@@ -84,12 +92,12 @@ jobs:
           Get-ChildItem "C:\ebout" -Recurse -ErrorAction SilentlyContinue | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,2)}} | Format-Table -AutoSize
           $appx = Get-ChildItem "C:\ebout" -Recurse -Include *.appx,*.msix -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($appx) {
-            Write-Host "*** SUCCESS $($appx.FullName) {0:N1} MB ***" -f ($appx.Length/1MB)
+            Write-Host ("*** SUCCESS " + $appx.FullName + " {0:N1} MB ***" -f ($appx.Length/1MB))
             New-Item -ItemType Directory -Force -Path dist-msix | Out-Null
             Copy-Item $appx.FullName "dist-msix\bluefish.appx" -Force
           } else {
             Write-Host "*** FAILED ***"
-            Get-Content p1.log -ErrorAction SilentlyContinue | Select-Object -Last 25
+            Get-Content p1.log -ErrorAction SilentlyContinue | Select-Object -Last 30
           }
       - name: Upload
         if: always()
