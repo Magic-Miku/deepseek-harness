@@ -3,17 +3,62 @@ name: Build MSIX (blue fish)
 on:
   workflow_dispatch:
     inputs:
-      build_version:
-        description: 'Build version: auto（推荐）或官方格式的完整版本'
+      appx_version:
+        description: 'MSIX 版本（auto = 1.0.<run>.0）'
         type: string
         default: 'auto'
         required: true
+      publish:
+        description: '是否提交商店（首次先不勾）'
+        type: boolean
+        default: false
+        required: true
+  schedule:
+    - cron: '17 3 * * 1'
 
 permissions:
   contents: write
 
 jobs:
+  check-update:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    outputs:
+      has_update: ${{ steps.cmp.outputs.has_update }}
+      upstream_tag: ${{ steps.cmp.outputs.upstream_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare upstream release tag
+        id: cmp
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          UP=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/deepseek-ai/deepseek-harness/releases/latest \
+            | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+          echo "upstream latest tag = $UP"
+          LOCAL=""
+          [ -f .last-upstream-tag ] && LOCAL=$(cat .last-upstream-tag)
+          echo "recorded tag = $LOCAL"
+          if [ -n "$UP" ] && [ "$UP" != "$LOCAL" ]; then
+            echo "has_update=true" >> $GITHUB_OUTPUT
+            echo "$UP" > .last-upstream-tag
+          else
+            echo "has_update=false" >> $GITHUB_OUTPUT
+          fi
+          echo "upstream_tag=$UP" >> $GITHUB_OUTPUT
+      - name: Commit updated tag marker
+        if: steps.cmp.outputs.has_update == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .last-upstream-tag
+          git commit -m "chore: record upstream tag ${{ steps.cmp.outputs.upstream_tag }}" || echo "no change"
+          git push || echo "push failed"
+
   build:
+    needs: [check-update]
+    if: github.event_name == 'workflow_dispatch' || needs.check-update.outputs.has_update == 'true'
     runs-on: windows-2022
     timeout-minutes: 120
     defaults:
@@ -36,17 +81,13 @@ jobs:
           version: 11.28.5
           run_install: false
 
-      # 官方脚本用 flag:'wx' 写 .env.windows——文件已存在会报错，先删掉
       - name: Remove stale .env.windows
-        shell: pwsh
         continue-on-error: true
         run: |
           if (Test-Path "apps/desktop/.env.windows") {
             Remove-Item "apps/desktop/.env.windows" -Force
-            Write-Host "removed stale .env.windows"
           }
 
-      # ★ 修复：必须在 Prepare 之前安装依赖（prepare 脚本 import 了 semver）
       - name: Install dependencies
         id: install
         continue-on-error: true
@@ -55,13 +96,12 @@ jobs:
           "EXIT=$LASTEXITCODE" | Tee-Object -Append -FilePath b1-install.log
           exit $LASTEXITCODE
 
-      # 与官方 windows-package.yml 一致的调用方式
       - name: Prepare package settings
         id: settings
         if: steps.install.outcome == 'success'
         continue-on-error: true
         env:
-          PACKAGE_BUILD_VERSION: ${{ inputs.build_version }}
+          PACKAGE_BUILD_VERSION: auto
           PACKAGE_DEPLOYMENT: test
           PACKAGE_POLICY_ORIGIN: https://example.invalid
           PACKAGE_LOGIN_ORIGINS: https://example.invalid
@@ -69,14 +109,6 @@ jobs:
           node apps/desktop/scripts/prepare-windows-ci.mjs *>&1 | Tee-Object -FilePath b0-prepare.log
           "EXIT=$LASTEXITCODE" | Tee-Object -Append -FilePath b0-prepare.log
 
-      - name: Show generated version
-        if: always()
-        shell: pwsh
-        run: |
-          "version = ${{ steps.settings.outputs.version }}" | Out-File b0-version.log -Append
-          Get-Content b0-version.log
-
-      # ① 官方脚本产出已打包的 app 目录（不生成 exe）
       - name: Package dir (official script, unsigned)
         id: dir
         if: steps.settings.outcome == 'success'
@@ -90,44 +122,110 @@ jobs:
           "EXIT=$LASTEXITCODE" | Tee-Object -Append -FilePath "..\..\b2-dir.log"
           Pop-Location
 
-      # 定位包含主 exe 的目录
       - name: Locate packaged dir
         id: locate
         if: steps.dir.outcome == 'success'
         shell: pwsh
-        continue-on-error: true
         run: |
-          $log = "b3-locate.log"
           $root = "apps/desktop/.desktop-build"
           $cands = Get-ChildItem -Path $root -Directory -Recurse -ErrorAction SilentlyContinue |
             Where-Object { Test-Path (Join-Path $_.FullName "DeepSeek Harness.exe") }
-          $cands | ForEach-Object { $_.FullName } | Out-File $log -Append
           $dir = $cands | Select-Object -First 1
-          if (-not $dir) {
-            $dir = Get-ChildItem -Path $root -Directory -Recurse -Filter "win-unpacked" -ErrorAction SilentlyContinue |
-              Select-Object -First 1
-          }
-          if (-not $dir) {
-            "NOT FOUND" | Out-File $log -Append
-          } else {
-            "apdir=$($dir.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
-            Write-Host "APP DIR = $($dir.FullName)"
-          }
-          Get-Content $log
+          if (-not $dir) { throw "找不到 app 目录" }
+          "apdir=$($dir.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
+          Write-Host "APP DIR = $($dir.FullName)"
 
-      # ② 用我们独立的配置打成 appx
-      - name: Build appx via prepackaged
-        id: appx
+      - name: Generate Assets icons
+        if: steps.locate.outcome == 'success'
+        shell: pwsh
+        run: |
+          $dir = "${{ steps.locate.outputs.apdir }}"
+          $assets = Join-Path $dir "Assets"
+          New-Item -ItemType Directory -Force -Path $assets | Out-Null
+          Add-Type -AssemblyName System.Drawing
+          function New-Icon($w, $h, $out) {
+            $b = New-Object System.Drawing.Bitmap $w, $h
+            $g = [System.Drawing.Graphics]::FromImage($b)
+            $g.Clear([System.Drawing.Color]::FromArgb(58, 95, 170))
+            $b.Save($out, [System.Drawing.Imaging.ImageFormat]::Png)
+            $g.Dispose(); $b.Dispose()
+          }
+          New-Icon 50  50  (Join-Path $assets "StoreLogo.png")
+          New-Icon 44  44  (Join-Path $assets "Square44x44Logo.png")
+          New-Icon 150 150 (Join-Path $assets "Square150x150Logo.png")
+          New-Icon 310 150 (Join-Path $assets "Wide310x150Logo.png")
+
+      - name: Resolve appx version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = "${{ inputs.appx_version }}"
+          if ($v -eq 'auto' -or $v -eq '') { $v = "1.0.$env:GITHUB_RUN_NUMBER.0" }
+          "version=$v" | Out-File -Append $env:GITHUB_OUTPUT
+          Write-Host "APPX VERSION = $v"
+
+      - name: Write AppxManifest.xml
+        if: steps.locate.outcome == 'success'
+        shell: pwsh
+        run: |
+          $dir = "${{ steps.locate.outputs.apdir }}"
+          $ver = "${{ steps.ver.outputs.version }}"
+          $xml = @"
+<?xml version="1.0" encoding="utf-8"?>
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap rescap">
+  <Identity Name="14714BE0.320850A8A419A" Publisher="CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" Version="$ver" />
+  <Properties>
+    <DisplayName>蓝色大肥鱼</DisplayName>
+    <PublisherDisplayName>𝕸ikน神教✨教主</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22621.0" />
+  </Dependencies>
+  <Resources>
+    <Resource Language="zh-cn" />
+    <Resource Language="en-us" />
+  </Resources>
+  <Applications>
+    <Application Id="App" Executable="DeepSeek Harness.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements DisplayName="蓝色大肥鱼" Description="蓝色大肥鱼" BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" />
+      </uap:VisualElements>
+    </Application>
+  </Applications>
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+    <Capability Name="internetClient" />
+  </Capabilities>
+</Package>
+"@
+          [System.IO.File]::WriteAllText((Join-Path $dir "AppxManifest.xml"), $xml, (New-Object System.Text.UTF8Encoding $false))
+          Get-Content (Join-Path $dir "AppxManifest.xml") | Select-Object -First 8
+
+      - name: Pack appx with makeappx
+        id: pack
         if: steps.locate.outcome == 'success'
         continue-on-error: true
-        env:
-          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        shell: pwsh
         run: |
-          pnpm exec electron-builder --win appx `
-            --prepackaged "${{ steps.locate.outputs.apdir }}" `
-            --config electron-builder-appx.yml *>&1 | Tee-Object -FilePath b4-appx.log
-          "EXIT=$LASTEXITCODE" | Tee-Object -Append -FilePath b4-appx.log
-          exit $LASTEXITCODE
+          $dir = "${{ steps.locate.outputs.apdir }}"
+          $kits = "C:\Program Files (x86)\Windows Kits\10\bin"
+          $makeappx = Get-ChildItem -Path $kits -Filter "makeappx.exe" -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "x64" } |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $makeappx) { throw "找不到 makeappx.exe" }
+          New-Item -ItemType Directory -Force -Path "dist-msix" | Out-Null
+          $out = "dist-msix\blue-fish.appx"
+          & $makeappx.FullName pack /d $dir /p $out /o *>&1 | Tee-Object -FilePath b4-makeappx.log
+          "EXIT=$LASTEXITCODE" | Tee-Object -Append -FilePath b4-makeappx.log
+          if (Test-Path $out) {
+            $sz = [math]::Round((Get-Item $out).Length/1MB,2)
+            Write-Host "APPX OK: $out ($sz MB)"
+          }
 
       - name: Report artifacts
         if: always()
@@ -135,14 +233,11 @@ jobs:
         run: |
           $log = "b5-artifacts.log"
           "=== dist-msix ===" | Out-File $log
-          (Get-ChildItem "dist-msix" -Recurse -ErrorAction SilentlyContinue |
-            Select-Object FullName, @{n='MB';e={[math]::Round($_.Length/1MB,2)}} |
-            Format-Table -AutoSize | Out-String) | Out-File $log -Append
-          "" | Out-File $log -Append
-          "=== 全仓搜索 appx/msix ===" | Out-File $log -Append
-          (Get-ChildItem . -Recurse -Include *.appx,*.msix -ErrorAction SilentlyContinue |
-            Select-Object FullName, @{n='MB';e={[math]::Round($_.Length/1MB,2)}} |
-            Format-Table -AutoSize | Out-String) | Out-File $log -Append
+          if (Test-Path "dist-msix") {
+            (Get-ChildItem "dist-msix" -Recurse -File -ErrorAction SilentlyContinue |
+              Select-Object FullName, @{n='MB';e={[math]::Round($_.Length/1MB,2)}} |
+              Format-Table -AutoSize | Out-String) | Out-File $log -Append
+          }
           Get-Content $log
 
       - name: Upload appx
@@ -163,15 +258,29 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      # 日志推到 probe-logs 分支，便于读取具体报错
-      - name: Commit logs to probe-logs
-        if: always()
-        shell: bash
-        continue-on-error: true
+  publish:
+    needs: [build]
+    if: |
+      (github.event_name == 'workflow_dispatch' && inputs.publish) ||
+      (github.event_name == 'schedule' && secrets.STORE_PRODUCT_ID != '')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dsh-msix
+          path: ./pkg
+      - uses: microsoft/microsoft-store-apppublisher@v1.1
+      - name: Configure Store credentials
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout --orphan probe-logs 2>/dev/null || git checkout probe-logs
-          git add -f b*.log 2>/dev/null || true
-          git commit -m "msix build logs run ${{ github.run_id }}" || echo "nothing"
-          git push -f origin probe-logs || echo "push failed"
+          msstore reconfigure `
+            --tenantId ${{ secrets.AZURE_AD_TENANT_ID }} `
+            --sellerId ${{ secrets.SELLER_ID }} `
+            --clientId ${{ secrets.AZURE_AD_APPLICATION_CLIENT_ID }} `
+            --clientSecret ${{ secrets.AZURE_AD_APPLICATION_SECRET }}
+      - name: Publish to Store (5% rollout)
+        shell: pwsh
+        run: |
+          $pkg = Get-ChildItem ./pkg -Include *.appx,*.msix -Recurse | Select-Object -First 1
+          msstore publish "$($pkg.FullName)" `
+            -id ${{ secrets.STORE_PRODUCT_ID }} `
+            --packageRolloutPercentage 5
