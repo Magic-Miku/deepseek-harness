@@ -26,10 +26,9 @@ jobs:
           $exe = Get-ChildItem $target -Recurse -Filter "DeepSeek Harness.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $exe) { throw "app exe not found" }
           $n = (Get-ChildItem $target -Recurse -File -ErrorAction SilentlyContinue).Count
-          Write-Host "appdir = $($exe.Directory.FullName)   files = $n (磁盘上完整，不删任何文件)"
+          Write-Host "appdir = $($exe.Directory.FullName)   files = $n"
           "appdir=$($exe.Directory.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
       - name: Write manifest and icons
-        id: prep
         run: |
           $d = "${{ steps.inst.outputs.appdir }}"
           $v = "1.0.$env:GITHUB_RUN_NUMBER.0"
@@ -64,7 +63,6 @@ jobs:
           I 310 150 (Join-Path $a "Wide310x150Logo.png")
           Write-Host "manifest + icons done"
       - name: Generate PackagingLayout.xml
-        id: layout
         run: |
           $d = "${{ steps.inst.outputs.appdir }}"
           $mf = Join-Path $d "AppxManifest.xml"
@@ -74,31 +72,33 @@ jobs:
           ('  <PackageFamily ID="BlueFish" ManifestPath="' + $mf + '" ResourceManager="false">')
           '    <Package ID="x64" ProcessorArchitecture="x64">'
           '      <Files>'
-          ('        <File DestinationPath="**" SourcePath="' + $d + '\**"/>')
-          '        <File ExcludePath="*\__pycache__\*"/>'
-          '        <File ExcludePath="*.pyc"/>'
-          '        <File ExcludePath="*.pyo"/>'
-          '        <File ExcludePath="*.pdb"/>'
+          ('        <File DestinationPath="**" SourcePath="' + $d + '\**" ExcludePath="**\__pycache__\**" />')
+          ('        <File DestinationPath="**" SourcePath="' + $d + '\**" ExcludePath="**\*.pyc" />')
+          ('        <File DestinationPath="**" SourcePath="' + $d + '\**" ExcludePath="**\*.pyo" />')
+          ('        <File DestinationPath="**" SourcePath="' + $d + '\**" ExcludePath="**\*.pdb" />')
           '      </Files>'
           '    </Package>'
           '  </PackageFamily>'
           '</PackagingLayout>'
           )
           [System.IO.File]::WriteAllText("$env:GITHUB_WORKSPACE\PackagingLayout.xml", ($L -join "`r`n"), (New-Object System.Text.UTF8Encoding $false))
+          Write-Host "=== PackagingLayout.xml ==="
           Get-Content "$env:GITHUB_WORKSPACE\PackagingLayout.xml"
-          # 统计会被排除的文件数
-          $pyc = (Get-ChildItem $d -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in @('.pyc','.pyo','.pdb') }).Count
-          $pycache = (Get-ChildItem $d -Directory -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq '__pycache__' } |
-            ForEach-Object { (Get-ChildItem $_.FullName -Recurse -File -ErrorAction SilentlyContinue).Count } | Measure-Object -Sum).Sum
-          Write-Host "=== 预计排除 ==="
-          Write-Host "  __pycache__ 下的文件: $pycache"
-          Write-Host "  .pyc/.pyo/.pdb 文件:  $pyc"
-      - name: Try MakeAppx build (Layout + Exclude)
+          Write-Host ""
+          Write-Host "=== 预计排除规模 ==="
+          $pc = Get-ChildItem $d -Directory -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq '__pycache__' }
+          $pcFiles = 0
+          foreach ($x in $pc) { $pcFiles += (Get-ChildItem $x.FullName -Recurse -File -ErrorAction SilentlyContinue).Count }
+          $ext = (Get-ChildItem $d -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in @('.pyc','.pyo','.pdb') }).Count
+          $total = (Get-ChildItem $d -Recurse -File -Force -ErrorAction SilentlyContinue).Count
+          Write-Host "  总文件数:        $total"
+          Write-Host "  __pycache__ 下:  $pcFiles"
+          Write-Host "  .pyc/.pyo/.pdb:  $ext"
+      - name: Try MakeAppx build
         id: build1
         continue-on-error: true
         run: |
           $mk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
-          New-Item -ItemType Directory -Force -Path "C:\out" | Out-Null
           New-Item -ItemType Directory -Force -Path "C:\outpkg" | Out-Null
           $sw = [System.Diagnostics.Stopwatch]::StartNew()
           & $mk build /f "$env:GITHUB_WORKSPACE\PackagingLayout.xml" /op "C:\outpkg" 2>&1 | Tee-Object b1.log
@@ -111,16 +111,18 @@ jobs:
             New-Item -ItemType Directory -Force -Path dist-msix | Out-Null
             Copy-Item $f.FullName "dist-msix\bluefish.appx" -Force
           } else {
-            Write-Host "*** 未产出，看日志 ***"
-            Get-Content b1.log -ErrorAction SilentlyContinue | Select-Object -Last 8
+            Write-Host "*** FAILED ***"
           }
-      - name: Check excluded count
+      - name: Show file count in log
         if: always()
         run: |
-          Write-Host "=== b1.log 里的文件数 ==="
+          Write-Host "=== 日志中的关键行 ==="
           Get-Content b1.log -ErrorAction SilentlyContinue |
-            Where-Object { $_ -match 'Pack|file\(s\)|error' } |
-            Select-Object -First 10
+            Where-Object { $_ -match 'Enumerat|Pack|Building package|error|Ignoring' } |
+            Select-Object -First 12
+          Write-Host ""
+          $n = (Get-Content b1.log -ErrorAction SilentlyContinue | Where-Object { $_ -match 'as a payload file' }).Count
+          Write-Host "实际处理文件数 = $n"
       - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
