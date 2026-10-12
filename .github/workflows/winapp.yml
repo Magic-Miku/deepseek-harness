@@ -1,0 +1,144 @@
+name: WinApp Pack
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      APPXSIP_LOG: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup WinApp CLI
+        uses: microsoft/setup-WinAppCli@v1
+        continue-on-error: true
+      - name: Verify winapp
+        run: |
+          Write-Host "=== winapp --help ==="
+          winapp --help 2>&1 | Select-Object -First 30
+          Write-Host "EXIT=$LASTEXITCODE"
+      - name: Download exe
+        run: |
+          curl.exe -L --retry 3 --max-time 1800 -o dsh.exe "https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe"
+          $s = (Get-Item dsh.exe).Length
+          Write-Host "size = $s"
+          if ($s -lt 200MB) { throw "download too small" }
+      - name: Extract layer 1
+        run: |
+          $z = "C:\Program Files\7-Zip\7z.exe"
+          New-Item -ItemType Directory -Force -Path "D:\L1" | Out-Null
+          & $z x dsh.exe -o"D:\L1" -y 2>&1 | Tee-Object a1.log
+          Write-Host "EXIT=$LASTEXITCODE"
+      - name: Extract layer 2
+        run: |
+          $inner = "D:\L1\`$PLUGINSDIR\app-64.7z"
+          Write-Host "exists = $(Test-Path $inner)"
+          if (-not (Test-Path $inner)) { throw "inner not found" }
+          $z = "C:\Program Files\7-Zip\7z.exe"
+          New-Item -ItemType Directory -Force -Path "D:\L2" | Out-Null
+          & $z x $inner -o"D:\L2" -y 2>&1 | Tee-Object a3.log
+          Write-Host "EXIT=$LASTEXITCODE"
+          $n = (Get-ChildItem "D:\L2" -Recurse -File -ErrorAction SilentlyContinue).Count
+          Write-Host "files = $n"
+      - name: Remove bracket files via dotnet
+        if: always()
+        run: |
+          $log = "a5.log"
+          $root = "D:\L2"
+          $removed = 0
+          $stack = New-Object System.Collections.Stack
+          $stack.Push($root)
+          while ($stack.Count -gt 0) {
+            $dir = $stack.Pop()
+            try {
+              foreach ($f in [System.IO.Directory]::GetFiles($dir)) {
+                $nm = [System.IO.Path]::GetFileName($f)
+                if ($nm.Contains("[") -or $nm.Contains("]")) {
+                  "REMOVE FILE: $f" | Out-File $log -Append
+                  [System.IO.File]::Delete($f)
+                  $removed++
+                }
+              }
+              foreach ($d in [System.IO.Directory]::GetDirectories($dir)) {
+                $nm = [System.IO.Path]::GetFileName($d)
+                if ($nm.Contains("[") -or $nm.Contains("]")) {
+                  "REMOVE DIR: $d" | Out-File $log -Append
+                  [System.IO.Directory]::Delete($d, $true)
+                  $removed++
+                } else { $stack.Push($d) }
+              }
+            } catch { "ERR: $dir $($_.Exception.Message)" | Out-File $log -Append }
+          }
+          "removed = $removed" | Out-File $log -Append
+          Get-Content $log
+      - name: Manifest generate
+        continue-on-error: true
+        run: |
+          winapp manifest generate "D:\L2" `
+            --package-name "14714BE0.320850A8A419A" `
+            --publisher-name "CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" `
+            --version "1.0.$env:GITHUB_RUN_NUMBER.0" `
+            --entrypoint "DeepSeek Harness.exe" `
+            --if-exists Overwrite 2>&1 | Tee-Object m1.log
+          Write-Host "EXIT=$LASTEXITCODE"
+      - name: Show manifest
+        if: always()
+        run: |
+          if (Test-Path "D:\L2\Package.appxmanifest") {
+            Write-Host "=== manifest ==="
+            Get-Content "D:\L2\Package.appxmanifest" | Select-Object -First 40
+          } else {
+            Write-Host "NO MANIFEST"
+          }
+      - name: Pack MSIX
+        id: pack
+        continue-on-error: true
+        run: |
+          winapp pack "D:\L2" --no-sign --output "D:\out\app.msix" 2>&1 | Tee-Object p1.log
+          Write-Host "EXIT=$LASTEXITCODE"
+          if (Test-Path "D:\out\app.msix") {
+            $s = (Get-Item "D:\out\app.msix").Length
+            Write-Host "*** MSIX OK $s bytes ***"
+            New-Item -ItemType Directory -Force -Path dist-msix | Out-Null
+            Copy-Item "D:\out\app.msix" "dist-msix\bluefish.msix" -Force
+          } else {
+            Write-Host "*** MSIX MISSING ***"
+            Get-ChildItem "D:\out" -ErrorAction SilentlyContinue
+          }
+      - name: Fallback makeappx with APPXSIP_LOG
+        if: steps.pack.outcome != 'success'
+        continue-on-error: true
+        run: |
+          $mk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
+          New-Item -ItemType Directory -Force -Path "D:\o" | Out-Null
+          & $mk pack /d "D:\L2" /p "D:\o\bf.appx" /o /nc 2>&1 | Tee-Object p2.log
+          Write-Host "makeappx EXIT=$LASTEXITCODE"
+          if (Test-Path "D:\o\bf.appx") {
+            New-Item -ItemType Directory -Force -Path dist-msix | Out-Null
+            Copy-Item "D:\o\bf.appx" "dist-msix\bluefish.appx" -Force
+            Write-Host "fallback OK"
+          }
+      - name: Upload msix
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-msix
+          path: dist-msix/*
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: winapp-logs
+          path: |
+            a*.log
+            m*.log
+            p*.log
+          if-no-files-found: warn
+          retention-days: 14
