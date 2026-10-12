@@ -46,9 +46,19 @@ jobs:
             Write-Host "removed stale .env.windows"
           }
 
+      # ★ 修复：必须在 Prepare 之前安装依赖（prepare 脚本 import 了 semver）
+      - name: Install dependencies
+        id: install
+        continue-on-error: true
+        run: |
+          pnpm install --frozen-lockfile *>&1 | Tee-Object -FilePath b1-install.log
+          "EXIT=$LASTEXITCODE" | Tee-Object -Append -FilePath b1-install.log
+          exit $LASTEXITCODE
+
       # 与官方 windows-package.yml 一致的调用方式
       - name: Prepare package settings
         id: settings
+        if: steps.install.outcome == 'success'
         continue-on-error: true
         env:
           PACKAGE_BUILD_VERSION: ${{ inputs.build_version }}
@@ -66,19 +76,10 @@ jobs:
           "version = ${{ steps.settings.outputs.version }}" | Out-File b0-version.log -Append
           Get-Content b0-version.log
 
-      - name: Install dependencies
-        id: install
-        if: steps.settings.outcome == 'success'
-        continue-on-error: true
-        run: |
-          pnpm install --frozen-lockfile *>&1 | Tee-Object -FilePath b1-install.log
-          "EXIT=$LASTEXITCODE" | Tee-Object -Append -FilePath b1-install.log
-          exit $LASTEXITCODE
-
       # ① 官方脚本产出已打包的 app 目录（不生成 exe）
       - name: Package dir (official script, unsigned)
         id: dir
-        if: steps.install.outcome == 'success'
+        if: steps.settings.outcome == 'success'
         continue-on-error: true
         env:
           PACKAGE_VERSION: ${{ steps.settings.outputs.version }}
@@ -162,7 +163,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      # ★ 新增：把日志推到 probe-logs 分支，便于读取具体报错
+      # 日志推到 probe-logs 分支，便于读取具体报错
       - name: Commit logs to probe-logs
         if: always()
         shell: bash
