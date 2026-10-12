@@ -66,19 +66,16 @@ jobs:
             Where-Object { Test-Path (Join-Path $_.FullName "DeepSeek Harness.exe") } | Select-Object -First 1
           if (-not $c) { throw "app dir not found" }
           Write-Host "source = $($c.FullName)"
-          $short = "D:\p"
-          if (Test-Path $short) { Remove-Item $short -Recurse -Force -ErrorAction SilentlyContinue }
-          New-Item -ItemType Directory -Force -Path $short | Out-Null
-          Write-Host "copying to $short ..."
-          Copy-Item -Path (Join-Path $c.FullName "*") -Destination $short -Recurse -Force
-          $n = (Get-ChildItem $short -Recurse -File -ErrorAction SilentlyContinue).Count
+          if (Test-Path "D:\p") { Remove-Item "D:\p" -Recurse -Force -ErrorAction SilentlyContinue }
+          New-Item -ItemType Directory -Force -Path "D:\p" | Out-Null
+          Copy-Item -Path (Join-Path $c.FullName "*") -Destination "D:\p" -Recurse -Force
+          $n = (Get-ChildItem "D:\p" -Recurse -File -ErrorAction SilentlyContinue).Count
           Write-Host "copied files: $n"
-          "short=$short" | Out-File -Append $env:GITHUB_OUTPUT
+          "short=D:\p" | Out-File -Append $env:GITHUB_OUTPUT
       - name: Icons
         if: steps.mv.outcome == 'success'
         run: |
-          $s = "${{ steps.mv.outputs.short }}"
-          New-Item -ItemType Directory -Force -Path "$s\Assets" | Out-Null
+          New-Item -ItemType Directory -Force -Path "D:\p\Assets" | Out-Null
           Add-Type -AssemblyName System.Drawing
           function I($w,$h,$o) {
             $b = New-Object System.Drawing.Bitmap $w,$h
@@ -87,11 +84,11 @@ jobs:
             $b.Save($o, [System.Drawing.Imaging.ImageFormat]::Png)
             $g.Dispose(); $b.Dispose()
           }
-          I 50 50 "$s\Assets\StoreLogo.png"
-          I 44 44 "$s\Assets\Square44x44Logo.png"
-          I 150 150 "$s\Assets\Square150x150Logo.png"
-          I 310 150 "$s\Assets\Wide310x150Logo.png"
-          Get-ChildItem "$s\Assets" | Select-Object Name, Length | Format-Table -AutoSize
+          I 50 50 "D:\p\Assets\StoreLogo.png"
+          I 44 44 "D:\p\Assets\Square44x44Logo.png"
+          I 150 150 "D:\p\Assets\Square150x150Logo.png"
+          I 310 150 "D:\p\Assets\Wide310x150Logo.png"
+          Get-ChildItem "D:\p\Assets" | Select-Object Name, Length | Format-Table -AutoSize
       - name: Version
         id: ver
         run: |
@@ -102,7 +99,6 @@ jobs:
       - name: Manifest
         if: steps.mv.outcome == 'success'
         run: |
-          $s = "${{ steps.mv.outputs.short }}"
           $v = "${{ steps.ver.outputs.version }}"
           $x = @(
           '<?xml version="1.0" encoding="utf-8"?>'
@@ -117,21 +113,19 @@ jobs:
           '  </Application></Applications>'
           '</Package>'
           )
-          [System.IO.File]::WriteAllText("$s\AppxManifest.xml", ($x -join "`r`n"), (New-Object System.Text.UTF8Encoding $false))
+          [System.IO.File]::WriteAllText("D:\p\AppxManifest.xml", ($x -join "`r`n"), (New-Object System.Text.UTF8Encoding $false))
           Write-Host "manifest written"
       - name: PACK
         id: pack
         if: steps.mv.outcome == 'success'
         continue-on-error: true
         run: |
-          $s = "${{ steps.mv.outputs.short }}"
           $mk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
+          Write-Host "makeappx exists: $(Test-Path $mk)"
           New-Item -ItemType Directory -Force -Path "D:\o" | Out-Null
-          Push-Location "D:\"
-          & $mk pack /d "p" /p "o\bf.appx" /o /nc *>&1 | Tee-Object ..\b4.log
-          $code = $LASTEXITCODE
-          "EXIT=$code" | Tee-Object -Append ..\b4.log
-          Pop-Location
+          Write-Host "D:\p exists: $(Test-Path 'D:\p')"
+          & $mk pack /d "D:\p" /p "D:\o\bf.appx" /o /nc 2>&1 | Tee-Object -FilePath b4.log
+          "EXIT=$LASTEXITCODE" | Tee-Object -Append -FilePath b4.log
           if (Test-Path "D:\o\bf.appx") {
             $sz = (Get-Item "D:\o\bf.appx").Length
             Write-Host "APPX OK $sz bytes"
@@ -143,7 +137,7 @@ jobs:
       - name: Show logs
         if: always()
         run: |
-          if (Test-Path b4.log) { Get-Content b4.log | Select-Object -Last 30 }
+          if (Test-Path b4.log) { Write-Host "=== b4.log tail ==="; Get-Content b4.log | Select-Object -Last 30 } else { Write-Host "b4.log NOT FOUND" }
       - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
