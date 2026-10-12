@@ -1,8 +1,5 @@
 name: DSH MSIX Probe
 
-# 阶段 1：探测官方构建脚本在 CI 上的实际表现。
-# 目的不是成功，而是暴露所有障碍（必填配置、工具链、依赖）。
-
 on:
   workflow_dispatch:
 
@@ -23,12 +20,35 @@ jobs:
         with:
           node-version: '22'
 
-      # ★ 关键修复：DSH 用 pnpm workspace，必须装 pnpm
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
           version: 11.28.5
           run_install: false
+
+      # ★ 关键：现场生成 .env.windows（不依赖仓库里的文件）
+      - name: Create .env.windows
+        shell: pwsh
+        run: |
+          $content = @'
+          DSH_DESKTOP_APP_ID=com.deepseek.harness
+          DSH_DESKTOP_AUTO_UPDATE_ENV=test
+          DOWNLOAD_TEST_ORIGIN=https://example.invalid/dsh-downloads
+          DOWNLOAD_TEST_RELEASE_ID=00000000000000000000000000000000
+          DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN=https://example.invalid/dsh-update-test
+          DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=https://example.invalid/dsh-update-prod
+          DSH_DESKTOP_MANDATORY_UPDATE_CONFIG={"allowedAuthOrigins":["https://example.invalid"]}
+          DSH_DESKTOP_WINDOWS_CER_FILE=
+          DSH_DESKTOP_WINDOWS_SIGNTOOL=
+          DSH_DESKTOP_WINDOWS_KEY_CONTAINER=
+          DSH_DESKTOP_WINDOWS_TOKEN_PIN=
+          DSH_DESKTOP_WINDOWS_SIGNATURE_CACHE_CONCURRENCY=4
+          '@
+          # 去掉每行前导空格
+          $lines = $content -split "`n" | ForEach-Object { $_.TrimStart() }
+          $lines -join "`n" | Out-File "apps/desktop/.env.windows" -Encoding utf8 -NoNewline
+          Write-Host "=== 已生成 .env.windows ==="
+          Get-Content "apps/desktop/.env.windows"
 
       - name: Verify pnpm
         shell: pwsh
@@ -36,54 +56,27 @@ jobs:
           Write-Host "node: $(node --version)"
           Write-Host "pnpm: $(pnpm --version)"
 
-      - name: Probe structure
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          $log = "probe-1-structure.log"
-          "=== 根目录 ===" | Out-File $log
-          (Get-ChildItem -Name) | Out-File $log -Append
-          "" | Out-File $log -Append
-          "=== version ===" | Out-File $log -Append
-          ((Get-Content "package.json" -Raw | ConvertFrom-Json).version) | Out-File $log -Append
-          "" | Out-File $log -Append
-          "=== apps/desktop/scripts 关键脚本 ===" | Out-File $log -Append
-          (Get-ChildItem "apps/desktop/scripts" -Name -ErrorAction SilentlyContinue |
-            Where-Object { $_ -match "package-target|env|toolchain" }) | Out-File $log -Append
-
       - name: Probe toolchain
         shell: pwsh
         continue-on-error: true
         run: |
           $log = "probe-2-toolchain.log"
-          "=== node / pnpm ===" | Out-File $log
-          "node : $(node --version)" | Out-File $log -Append
+          "node : $(node --version)" | Out-File $log
           "pnpm : $(pnpm --version)" | Out-File $log -Append
           "" | Out-File $log -Append
-          "=== tar（构建脚本必需，用 probeTar 的方式测）===" | Out-File $log -Append
+          "=== tar ===" | Out-File $log -Append
           $tmp = Join-Path $env:RUNNER_TEMP "tarprobe"
           New-Item -ItemType Directory -Force -Path $tmp | Out-Null
           Set-Content -Path (Join-Path $tmp "probe.txt") -Value "probe"
           Push-Location $tmp
-          "tar -czf 结果:" | Out-File $log -Append
           (tar -czf probe.tar.gz probe.txt 2>&1) | Out-File $log -Append
-          "exit=$LASTEXITCODE" | Out-File $log -Append
-          "tar -tzf 结果:" | Out-File $log -Append
           (tar -tzf probe.tar.gz 2>&1) | Out-File $log -Append
-          "exit=$LASTEXITCODE" | Out-File $log -Append
           Pop-Location
           "" | Out-File $log -Append
-          "=== MSVC / vswhere（构建脚本必需）===" | Out-File $log -Append
+          "=== MSVC ===" | Out-File $log -Append
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          "vswhere exists : $(Test-Path $vswhere)" | Out-File $log -Append
-          if (Test-Path $vswhere) {
-            $p = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-            "VC tools path  : $p" | Out-File $log -Append
-            "VC tools found : $($p -ne '')" | Out-File $log -Append
-          }
-          "" | Out-File $log -Append
-          "=== 磁盘空间 ===" | Out-File $log -Append
-          (Get-PSDrive C | ForEach-Object { "Free: {0:N1} GB" -f ($_.Free/1GB) }) | Out-File $log -Append
+          $p = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          "VC tools : $p" | Out-File $log -Append
 
       - name: Install dependencies
         id: install
@@ -94,14 +87,13 @@ jobs:
           pnpm install --frozen-lockfile *>&1 | Tee-Object -FilePath $log
           "EXIT=$LASTEXITCODE" | Tee-Object -Append -FilePath $log
 
-      - name: Probe package check mode
+      - name: Probe check mode
         id: check
         shell: pwsh
         continue-on-error: true
         run: |
           $log = "probe-4-check.log"
-          "=== 尝试官方 check:package ===" | Out-File $log
-          pnpm --filter @deepseek-ai/dsh-desktop run check:package *>&1 | Tee-Object -Append -FilePath $log
+          pnpm --filter @deepseek-ai/dsh-desktop run check:package *>&1 | Tee-Object -FilePath $log
           "EXIT=$LASTEXITCODE" | Tee-Object -Append -FilePath $log
 
       - name: Commit logs
