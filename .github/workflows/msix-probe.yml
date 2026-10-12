@@ -23,6 +23,19 @@ jobs:
         with:
           node-version: '22'
 
+      # ★ 关键修复：DSH 用 pnpm workspace，必须装 pnpm
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.28.5
+          run_install: false
+
+      - name: Verify pnpm
+        shell: pwsh
+        run: |
+          Write-Host "node: $(node --version)"
+          Write-Host "pnpm: $(pnpm --version)"
+
       - name: Probe structure
         shell: pwsh
         continue-on-error: true
@@ -31,15 +44,12 @@ jobs:
           "=== 根目录 ===" | Out-File $log
           (Get-ChildItem -Name) | Out-File $log -Append
           "" | Out-File $log -Append
-          "=== apps/desktop 部署 ===" | Out-File $log -Append
-          (Get-ChildItem "apps/desktop" -Name -ErrorAction SilentlyContinue) | Out-File $log -Append
+          "=== version ===" | Out-File $log -Append
+          ((Get-Content "package.json" -Raw | ConvertFrom-Json).version) | Out-File $log -Append
           "" | Out-File $log -Append
-          "=== package.json 关键字段 ===" | Out-File $log -Append
-          $root = Get-Content "package.json" -Raw | ConvertFrom-Json
-          "name    : $($root.name)" | Out-File $log -Append
-          "version : $($root.version)" | Out-File $log -Append
-          "pm      : $($root.packageManager)" | Out-File $log -Append
-          "engines : $($root.engines.node)" | Out-File $log -Append
+          "=== apps/desktop/scripts 关键脚本 ===" | Out-File $log -Append
+          (Get-ChildItem "apps/desktop/scripts" -Name -ErrorAction SilentlyContinue |
+            Where-Object { $_ -match "package-target|env|toolchain" }) | Out-File $log -Append
 
       - name: Probe toolchain
         shell: pwsh
@@ -50,17 +60,26 @@ jobs:
           "node : $(node --version)" | Out-File $log -Append
           "pnpm : $(pnpm --version)" | Out-File $log -Append
           "" | Out-File $log -Append
-          "=== tar（构建脚本必需）===" | Out-File $log -Append
-          $tar = (Get-Command tar -ErrorAction SilentlyContinue).Source
-          "path : $tar" | Out-File $log -Append
-          (tar --version 2>&1 | Select-Object -First 1) | Out-File $log -Append
+          "=== tar（构建脚本必需，用 probeTar 的方式测）===" | Out-File $log -Append
+          $tmp = Join-Path $env:RUNNER_TEMP "tarprobe"
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          Set-Content -Path (Join-Path $tmp "probe.txt") -Value "probe"
+          Push-Location $tmp
+          "tar -czf 结果:" | Out-File $log -Append
+          (tar -czf probe.tar.gz probe.txt 2>&1) | Out-File $log -Append
+          "exit=$LASTEXITCODE" | Out-File $log -Append
+          "tar -tzf 结果:" | Out-File $log -Append
+          (tar -tzf probe.tar.gz 2>&1) | Out-File $log -Append
+          "exit=$LASTEXITCODE" | Out-File $log -Append
+          Pop-Location
           "" | Out-File $log -Append
           "=== MSVC / vswhere（构建脚本必需）===" | Out-File $log -Append
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           "vswhere exists : $(Test-Path $vswhere)" | Out-File $log -Append
           if (Test-Path $vswhere) {
-            $path = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-            "VC tools path  : $path" | Out-File $log -Append
+            $p = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+            "VC tools path  : $p" | Out-File $log -Append
+            "VC tools found : $($p -ne '')" | Out-File $log -Append
           }
           "" | Out-File $log -Append
           "=== 磁盘空间 ===" | Out-File $log -Append
@@ -74,7 +93,6 @@ jobs:
           $log = "probe-3-install.log"
           pnpm install --frozen-lockfile *>&1 | Tee-Object -FilePath $log
           "EXIT=$LASTEXITCODE" | Tee-Object -Append -FilePath $log
-          exit $LASTEXITCODE
 
       - name: Probe package check mode
         id: check
@@ -82,10 +100,9 @@ jobs:
         continue-on-error: true
         run: |
           $log = "probe-4-check.log"
-          # 官方自带的 --check 模式：只校验配置与工具链，不做真实构建
-          pnpm --filter @deepseek-ai/dsh-desktop run check:package *>&1 | Tee-Object -FilePath $log
+          "=== 尝试官方 check:package ===" | Out-File $log
+          pnpm --filter @deepseek-ai/dsh-desktop run check:package *>&1 | Tee-Object -Append -FilePath $log
           "EXIT=$LASTEXITCODE" | Tee-Object -Append -FilePath $log
-          exit $LASTEXITCODE
 
       - name: Commit logs
         if: always()
@@ -96,7 +113,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout --orphan probe-logs 2>/dev/null || git checkout probe-logs
           git add -f probe-*.log
-          git commit -m "probe run ${{ github.run_id }} install=${{ steps.install.outcome }} check=${{ steps.check.outcome }}" || echo "nothing to commit"
+          git commit -m "probe run ${{ github.run_id }} install=${{ steps.install.outcome }} check=${{ steps.check.outcome }}" || echo "nothing"
           git push -f origin probe-logs
 
       - name: Upload logs
