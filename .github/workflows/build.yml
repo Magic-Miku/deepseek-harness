@@ -72,6 +72,23 @@ jobs:
           $n = (Get-ChildItem "D:\p" -Recurse -File -ErrorAction SilentlyContinue).Count
           Write-Host "copied files: $n"
           "short=D:\p" | Out-File -Append $env:GITHUB_OUTPUT
+      - name: Remove ILLEGAL bracket files
+        if: steps.mv.outcome == 'success'
+        run: |
+          $log = "b5-remove.log"
+          "=== 打包前扫描非法字符 [ ] ===" | Out-File $log
+          $bad = Get-ChildItem "D:\p" -Recurse -File -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '\[|\]' }
+          "找到 $($bad.Count) 个含方括号的文件：" | Out-File $log -Append
+          $bad | ForEach-Object { "  REMOVE: " + $_.FullName.Replace("D:\p\","") } | Out-File $log -Append
+          $bad | Remove-Item -Force -ErrorAction SilentlyContinue
+          "已删除 | Out-File $log -Append
+          "" | Out-File $log -Append
+          "=== 再次确认（应为 0）===" | Out-File $log -Append
+          $left = Get-ChildItem "D:\p" -Recurse -File -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '\[|\]' }
+          "剩余 $($left.Count)" | Out-File $log -Append
+          Get-Content $log
       - name: Icons
         if: steps.mv.outcome == 'success'
         run: |
@@ -121,9 +138,7 @@ jobs:
         continue-on-error: true
         run: |
           $mk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
-          Write-Host "makeappx exists: $(Test-Path $mk)"
           New-Item -ItemType Directory -Force -Path "D:\o" | Out-Null
-          Write-Host "D:\p exists: $(Test-Path 'D:\p')"
           & $mk pack /d "D:\p" /p "D:\o\bf.appx" /o /nc 2>&1 | Tee-Object -FilePath b4.log
           "EXIT=$LASTEXITCODE" | Tee-Object -Append -FilePath b4.log
           if (Test-Path "D:\o\bf.appx") {
@@ -134,10 +149,19 @@ jobs:
           } else {
             Write-Host "APPX MISSING"
           }
-      - name: Show logs
+      - name: Show result
         if: always()
         run: |
-          if (Test-Path b4.log) { Write-Host "=== b4.log tail ==="; Get-Content b4.log | Select-Object -Last 30 } else { Write-Host "b4.log NOT FOUND" }
+          if (Test-Path b4.log) {
+            Write-Host "=== b4.log 最后 10 行 ==="
+            Get-Content b4.log | Select-Object -Last 10
+          }
+          if (Test-Path dist-msix\bluefish.appx) {
+            $s = (Get-Item dist-msix\bluefish.appx).Length
+            Write-Host "*** SUCCESS: $s bytes ***"
+          } else {
+            Write-Host "*** NO APPX ***"
+          }
       - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
