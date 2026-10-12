@@ -41,14 +41,22 @@ jobs:
           $n = (Get-ChildItem $target -Recurse -File -ErrorAction SilentlyContinue).Count
           Write-Host "appdir = $($exe.Directory.FullName)   files = $n"
           "appdir=$($exe.Directory.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
-      - name: Check electron-builder availability
+      - name: Diagnose electron module
         run: |
-          Write-Host "=== apps/desktop 下查找 electron-builder ==="
-          $eb = "apps\desktop\node_modules\.bin\electron-builder.cmd"
-          Write-Host "exists: $(Test-Path $eb)"
-          if (Test-Path $eb) { & $eb --version }
-          Write-Host "=== pnpm --filter 方式 ==="
-          pnpm --filter @deepseek-ai/dsh-desktop exec electron-builder --version 2>&1 | Select-Object -First 5
+          Write-Host "=== apps/desktop/node_modules/electron ==="
+          Test-Path "apps\desktop\node_modules\electron"
+          Get-ChildItem "apps\desktop\node_modules\electron" -ErrorAction SilentlyContinue | Select-Object -First 5 Name
+          Write-Host "=== .pnpm 里的 electron ==="
+          Get-ChildItem "node_modules\.pnpm" -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like "electron@*" } | Select-Object -First 5 Name
+          Get-ChildItem "apps\desktop\node_modules\.pnpm" -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like "electron@*" } | Select-Object -First 5 Name
+          Write-Host "=== apps/desktop/package.json 里的 electron ==="
+          if (Test-Path "apps\desktop\package.json") {
+            $pk = Get-Content "apps\desktop\package.json" -Raw | ConvertFrom-Json
+            Write-Host ("devDependencies.electron = " + $pk.devDependencies.electron)
+            Write-Host ("dependencies.electron = " + $pk.dependencies.electron)
+          }
       - name: Write config
         run: |
           $L = @(
@@ -81,23 +89,26 @@ jobs:
         run: |
           $d = "${{ steps.inst.outputs.appdir }}"
           New-Item -ItemType Directory -Force -Path "C:\ebout" | Out-Null
-          $eb = "apps\desktop\node_modules\.bin\electron-builder.cmd"
-          if (-not (Test-Path $eb)) { throw "electron-builder not found at $eb" }
+          $eb = "$env:GITHUB_WORKSPACE\apps\desktop\node_modules\.bin\electron-builder.cmd"
+          if (-not (Test-Path $eb)) { throw "electron-builder not found" }
+          Write-Host "=== 在 apps/desktop 下运行 ==="
+          Push-Location "apps\desktop"
           $sw = [System.Diagnostics.Stopwatch]::StartNew()
-          & $eb --win appx --prepackaged $d --config "$env:GITHUB_WORKSPACE\eb-appx.yml" --publish never *>&1 | Tee-Object p1.log
+          & $eb --win appx --prepackaged $d --config "$env:GITHUB_WORKSPACE\eb-appx.yml" --publish never *>&1 | Tee-Object "$env:GITHUB_WORKSPACE\p1.log"
           $code = $LASTEXITCODE
           $sw.Stop()
+          Pop-Location
           Write-Host "EXIT=$code  elapsed=$([math]::Round($sw.Elapsed.TotalSeconds))s"
           Write-Host "=== C:\ebout ==="
           Get-ChildItem "C:\ebout" -Recurse -ErrorAction SilentlyContinue | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,2)}} | Format-Table -AutoSize
           $appx = Get-ChildItem "C:\ebout" -Recurse -Include *.appx,*.msix -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($appx) {
-            Write-Host ("*** SUCCESS " + $appx.FullName + " {0:N1} MB ***" -f ($appx.Length/1MB))
-            New-Item -ItemType Directory -Force -Path dist-msix | Out-Null
-            Copy-Item $appx.FullName "dist-msix\bluefish.appx" -Force
+            Write-Host ("*** SUCCESS " + $appx.FullName + " ***")
+            New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\dist-msix" | Out-Null
+            Copy-Item $appx.FullName "$env:GITHUB_WORKSPACE\dist-msix\bluefish.appx" -Force
           } else {
             Write-Host "*** FAILED ***"
-            Get-Content p1.log -ErrorAction SilentlyContinue | Select-Object -Last 30
+            Get-Content "$env:GITHUB_WORKSPACE\p1.log" -ErrorAction SilentlyContinue | Select-Object -Last 30
           }
       - name: Upload
         if: always()
