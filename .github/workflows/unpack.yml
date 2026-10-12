@@ -1,0 +1,167 @@
+name: Unpack Package
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Download official exe
+        continue-on-error: true
+        run: |
+          $urls = @(
+            "https://deepseek.com/harness/download/dsh-latest-windows-x64.exe",
+            "https://www.deepseek.com/harness/download/dsh-latest-windows-x64.exe",
+            "https://cdn.deepseek.com/harness/dsh-latest-windows-x64.exe"
+          )
+          foreach ($u in $urls) {
+            Write-Host "try: $u"
+            try {
+              Invoke-WebRequest -Uri $u -OutFile "dsh.exe" -MaximumRedirection 10 -TimeoutSec 600 -UseBasicParsing
+              $len = (Get-Item dsh.exe).Length
+              Write-Host "OK $len bytes from $u"
+              if ($len -gt 100MB) { break }
+            } catch {
+              Write-Host "fail: $($_.Exception.Message)"
+            }
+          }
+          if (Test-Path dsh.exe) {
+            Write-Host "final size = $((Get-Item dsh.exe).Length)"
+            $h = (Get-FileHash dsh.exe -Algorithm SHA256).Hash
+            Write-Host "SHA256 = $h"
+          }
+      - name: Find 7z
+        id: z
+        run: |
+          $cands = @(
+            "C:\Program Files\7-Zip\7z.exe",
+            "C:\Program Files (x86)\7-Zip\7z.exe",
+            "$env:ProgramFiles\7-Zip\7z.exe"
+          )
+          $found = $null
+          foreach ($c in $cands) { if (Test-Path $c) { $found = $c; break } }
+          if (-not $found) {
+            $cmd = Get-Command 7z -ErrorAction SilentlyContinue
+            if ($cmd) { $found = $cmd.Source }
+          }
+          Write-Host "7z = $found"
+          if (-not $found) {
+            Write-Host "=== searching ===" 
+            Get-ChildItem "C:\Program Files","C:\Program Files (x86)" -Filter "7z.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 5 -ExpandProperty FullName
+          }
+          "z=$found" | Out-File -Append $env:GITHUB_OUTPUT
+      - name: Extract exe
+        id: ex
+        continue-on-error: true
+        run: |
+          if (-not (Test-Path dsh.exe)) { Write-Host "no exe"; exit }
+          $z = "${{ steps.z.outputs.z }}"
+          if (-not $z) { Write-Host "no 7z"; exit }
+          New-Item -ItemType Directory -Force -Path "D:\u" | Out-Null
+          & $z x dsh.exe -o"D:\u" -y 2>&1 | Tee-Object u1.log
+          Write-Host "EXIT=$LASTEXITCODE"
+          Get-ChildItem "D:\u" | Select-Object Name, Length | Format-Table -AutoSize
+      - name: Inspect
+        if: always()
+        run: |
+          $log = "u2.log"
+          "=== D:\u 顶层 ===" | Out-File $log
+          Get-ChildItem "D:\u" -ErrorAction SilentlyContinue | Select-Object Name | Format-Table -AutoSize | Out-String | Out-File $log -Append
+          "" | Out-File $log -Append
+          "=== 找 DeepSeek Harness.exe ===" | Out-File $log -Append
+          Get-ChildItem "D:\u" -Recurse -Filter "DeepSeek Harness.exe" -ErrorAction SilentlyContinue | Select-Object -First 3 -ExpandProperty FullName | Out-File $log -Append
+          "" | Out-File $log -Append
+          "=== 找 app.asar ===" | Out-File $log -Append
+          Get-ChildItem "D:\u" -Recurse -Filter "app.asar" -ErrorAction SilentlyContinue | Select-Object -First 3 -ExpandProperty FullName | Out-File $log -Append
+          "" | Out-File $log -Append
+          "=== 文件总数 ===" | Out-File $log -Append
+          "files=" + (Get-ChildItem "D:\u" -Recurse -File -ErrorAction SilentlyContinue).Count | Out-File $log -Append
+          "" | Out-File $log -Append
+          "=== 含方括号的文件 ===" | Out-File $log -Append
+          Get-ChildItem "D:\u" -Recurse -File -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '\[|\]' } |
+            Select-Object -First 10 -ExpandProperty FullName | Out-File $log -Append
+          Get-Content $log
+      - name: Pack MSIX
+        id: pack
+        if: always()
+        continue-on-error: true
+        run: |
+          $exe = Get-ChildItem "D:\u" -Recurse -Filter "DeepSeek Harness.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) { Write-Host "no app exe"; exit }
+          $appdir = $exe.Directory.FullName
+          Write-Host "appdir = $appdir"
+          New-Item -ItemType Directory -Force -Path "$appdir\Assets" | Out-Null
+          Add-Type -AssemblyName System.Drawing
+          function I($w,$h,$o) {
+            $b = New-Object System.Drawing.Bitmap $w,$h
+            $g = [System.Drawing.Graphics]::FromImage($b)
+            $g.Clear([System.Drawing.Color]::FromArgb(58,95,170))
+            $b.Save($o, [System.Drawing.Imaging.ImageFormat]::Png)
+            $g.Dispose(); $b.Dispose()
+          }
+          I 50 50 "$appdir\Assets\StoreLogo.png"
+          I 44 44 "$appdir\Assets\Square44x44Logo.png"
+          I 150 150 "$appdir\Assets\Square150x150Logo.png"
+          I 310 150 "$appdir\Assets\Wide310x150Logo.png"
+          $v = "1.0.$env:GITHUB_RUN_NUMBER.0"
+          Write-Host "version = $v"
+          $x = @(
+          '<?xml version="1.0" encoding="utf-8"?>'
+          '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap rescap">'
+          ('  <Identity Name="14714BE0.320850A8A419A" Version="' + $v + '" Publisher="CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" ProcessorArchitecture="x64" />')
+          '  <Properties><DisplayName>BlueFish</DisplayName><PublisherDisplayName>Miku</PublisherDisplayName><Logo>Assets\StoreLogo.png</Logo></Properties>'
+          '  <Resources><Resource Language="en-us" /></Resources>'
+          '  <Dependencies><TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22621.0" /></Dependencies>'
+          '  <Capabilities><rescap:Capability Name="runFullTrust" /><Capability Name="internetClient" /></Capabilities>'
+          '  <Applications><Application Id="App" Executable="DeepSeek Harness.exe" EntryPoint="Windows.FullTrustApplication">'
+          '    <uap:VisualElements DisplayName="BlueFish" Description="BlueFish" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png" BackgroundColor="transparent" />'
+          '  </Application></Applications>'
+          '</Package>'
+          )
+          [System.IO.File]::WriteAllText("$appdir\AppxManifest.xml", ($x -join "`r`n"), (New-Object System.Text.UTF8Encoding $false))
+          Write-Host "=== 删除含方括号的文件 ==="
+          $bad = Get-ChildItem $appdir -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '\[|\]' }
+          $bad | ForEach-Object { Write-Host ("REMOVE: " + $_.FullName) }
+          $bad | Remove-Item -Force -ErrorAction SilentlyContinue
+          Write-Host "removed = $($bad.Count)"
+          Write-Host "=== makeappx ==="
+          $mk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
+          New-Item -ItemType Directory -Force -Path "D:\o" | Out-Null
+          & $mk pack /d $appdir /p "D:\o\bf.appx" /o /nc 2>&1 | Tee-Object p1.log
+          Write-Host "EXIT=$LASTEXITCODE"
+          if (Test-Path "D:\o\bf.appx") {
+            $s = (Get-Item "D:\o\bf.appx").Length
+            Write-Host "*** APPX OK $s bytes ***"
+            New-Item -ItemType Directory -Force -Path dist-msix | Out-Null
+            Copy-Item "D:\o\bf.appx" "dist-msix\bluefish.appx" -Force
+          } else {
+            Write-Host "*** APPX MISSING ***"
+            Get-Content p1.log -ErrorAction SilentlyContinue | Select-Object -Last 15
+          }
+      - name: Upload appx
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-msix
+          path: dist-msix/*.appx
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unpack-logs
+          path: |
+            u*.log
+            p*.log
+          if-no-files-found: warn
+          retention-days: 14
