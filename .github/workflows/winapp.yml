@@ -1,12 +1,6 @@
 name: WinApp Pack
 on:
   workflow_dispatch:
-    inputs:
-      mode:
-        description: 'cleanup level: light / medium / heavy'
-        type: choice
-        options: [light, medium, heavy]
-        default: medium
 permissions:
   contents: write
 jobs:
@@ -18,7 +12,21 @@ jobs:
         shell: pwsh
     steps:
       - uses: actions/checkout@v4
-      - name: Silent install
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.28.5
+          run_install: false
+      - name: Install electron-builder
+        run: |
+          pnpm install --frozen-lockfile *>&1 | Tee-Object i1.log
+          Write-Host "EXIT=$LASTEXITCODE"
+          pnpm exec electron-builder --version
+      - name: Silent install app
         id: inst
         run: |
           $tmp = "$env:RUNNER_TEMP\dsh.exe"
@@ -32,165 +40,56 @@ jobs:
           $exe = Get-ChildItem $target -Recurse -Filter "DeepSeek Harness.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $exe) { throw "app exe not found" }
           Write-Host "appdir = $($exe.Directory.FullName)"
+          $n = (Get-ChildItem $target -Recurse -File -ErrorAction SilentlyContinue).Count
+          Write-Host "files = $n (完整，不删任何文件)"
           "appdir=$($exe.Directory.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
-      - name: Cleanup
-        id: clean
+      - name: Write electron-builder config
         run: |
-          $d = "${{ steps.inst.outputs.appdir }}"
-          $mode = "${{ inputs.mode }}"
-          $log = "s0-clean.log"
-          "mode = $mode" | Out-File $log
-          $before = Get-ChildItem $d -Recurse -File -ErrorAction SilentlyContinue
-          "BEFORE: files=$($before.Count)  size={0:N1} MB" -f (($before | Measure-Object Length -Sum).Sum/1MB) | Out-File $log -Append
-          "" | Out-File $log -Append
-
-          # ---- 1. 所有 __pycache__ / *.pyc（编译缓存，运行时自动重建）----
-          $pyc = Get-ChildItem $d -Directory -Recurse -Force -Filter "__pycache__" -ErrorAction SilentlyContinue
-          $n1 = 0
-          foreach ($x in $pyc) {
-            $n1 += (Get-ChildItem $x.FullName -Recurse -File -ErrorAction SilentlyContinue).Count
-            Remove-Item $x.FullName -Recurse -Force -ErrorAction SilentlyContinue
-          }
-          "REMOVED __pycache__ dirs=$($pyc.Count)  files=$n1" | Out-File $log -Append
-
-          # ---- 2. Python 的 tests / test 目录 ----
-          $td = Get-ChildItem $d -Directory -Recurse -Force -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -in @("tests","test") -and $_.FullName -match "site-packages" }
-          $n2 = 0
-          foreach ($x in $td) {
-            $n2 += (Get-ChildItem $x.FullName -Recurse -File -ErrorAction SilentlyContinue).Count
-            Remove-Item $x.FullName -Recurse -Force -ErrorAction SilentlyContinue
-          }
-          "REMOVED test dirs=$($td.Count)  files=$n2" | Out-File $log -Append
-
-          # ---- 3. libreoffice 源码 patch（编译用，运行不需要）----
-          $pt = Get-ChildItem $d -Recurse -File -Force -ErrorAction SilentlyContinue |
-            Where-Object { $_.Extension -eq ".patch" -or $_.Extension -eq ".diff" }
-          $n3 = 0
-          foreach ($x in $pt) { Remove-Item $x.FullName -Force -ErrorAction SilentlyContinue; $n3++ }
-          "REMOVED patch/diff files=$n3" | Out-File $log -Append
-
-          if ($mode -in @("medium","heavy")) {
-            # ---- 4. Python 的 docs / examples / *.dist-info/RECORD ----
-            $dd = Get-ChildItem $d -Directory -Recurse -Force -ErrorAction SilentlyContinue |
-              Where-Object { $_.Name -in @("docs","doc","examples","example","demos") -and $_.FullName -match "site-packages" }
-            $n4 = 0
-            foreach ($x in $dd) {
-              $n4 += (Get-ChildItem $x.FullName -Recurse -File -ErrorAction SilentlyContinue).Count
-              Remove-Item $x.FullName -Recurse -Force -ErrorAction SilentlyContinue
-            }
-            "REMOVED doc dirs=$($dd.Count)  files=$n4" | Out-File $log -Append
-
-            # ---- 5. *.pyi 类型存根（运行时不用）----
-            $pyi = Get-ChildItem $d -Recurse -File -Force -Filter "*.pyi" -ErrorAction SilentlyContinue
-            $n5 = 0
-            foreach ($x in $pyi) { Remove-Item $x.FullName -Force -ErrorAction SilentlyContinue; $n5++ }
-            "REMOVED *.pyi files=$n5" | Out-File $log -Append
-
-            # ---- 6. pip 内置（我们有独立 python，不需要 pip 完整体）----
-            $pip = Get-ChildItem $d -Directory -Recurse -Force -ErrorAction SilentlyContinue |
-              Where-Object { $_.Name -eq "_vendor" -and $_.FullName -match "\\pip\\" }
-            $n6 = 0
-            foreach ($x in $pip) {
-              $n6 += (Get-ChildItem $x.FullName -Recurse -File -ErrorAction SilentlyContinue).Count
-              Remove-Item $x.FullName -Recurse -Force -ErrorAction SilentlyContinue
-            }
-            "REMOVED pip _vendor dirs=$($pip.Count)  files=$n6" | Out-File $log -Append
-          }
-
-          if ($mode -eq "heavy") {
-            # ---- 7. libreoffice 的 program 下非必要资源 ----
-            $lo = Join-Path $d "resources\app.asar.unpacked\dsh\node_modules\@deepseek-ai\libreoffice-kit-win32-x64\program"
-            foreach ($sub in @("presets","wizards")) {
-              $full = Join-Path $lo $sub
-              if (Test-Path $full) {
-                $c = (Get-ChildItem $full -Recurse -File -ErrorAction SilentlyContinue).Count
-                Remove-Item $full -Recurse -Force -ErrorAction SilentlyContinue
-                "REMOVED libreoffice\$sub  files=$c" | Out-File $log -Append
-              }
-            }
-            # ---- 8. python 的 tcl/tk 演示 ----
-            $tcl = Join-Path $d "resources\runtime\primary-runtime\dependencies\python\tcl"
-            if (Test-Path $tcl) {
-              $c = (Get-ChildItem $tcl -Recurse -File -ErrorAction SilentlyContinue).Count
-              Remove-Item $tcl -Recurse -Force -ErrorAction SilentlyContinue
-              "REMOVED python\tcl  files=$c" | Out-File $log -Append
-            }
-          }
-
-          "" | Out-File $log -Append
-          $after = Get-ChildItem $d -Recurse -File -ErrorAction SilentlyContinue
-          "AFTER: files=$($after.Count)  size={0:N1} MB" -f (($after | Measure-Object Length -Sum).Sum/1MB) | Out-File $log -Append
-          Get-Content $log
-      - name: Remove bracket files
-        run: |
-          $d = "${{ steps.inst.outputs.appdir }}"
-          $removed = 0
-          $stack = New-Object System.Collections.Stack
-          $stack.Push($d)
-          while ($stack.Count -gt 0) {
-            $dir = $stack.Pop()
-            try {
-              foreach ($f in [System.IO.Directory]::GetFiles($dir)) {
-                $nm = [System.IO.Path]::GetFileName($f)
-                if ($nm.Contains("[") -or $nm.Contains("]")) { [System.IO.File]::Delete($f); $removed++ }
-              }
-              foreach ($sub in [System.IO.Directory]::GetDirectories($dir)) { $stack.Push($sub) }
-            } catch {}
-          }
-          Write-Host "bracket files removed = $removed"
-      - name: Write manifest and icons
-        run: |
-          $d = "${{ steps.inst.outputs.appdir }}"
-          $v = "1.0.$env:GITHUB_RUN_NUMBER.0"
-          Write-Host "version = $v"
           $L = @(
-          '<?xml version="1.0" encoding="utf-8"?>'
-          '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap rescap">'
-          ('  <Identity Name="14714BE0.320850A8A419A" Publisher="CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" Version="' + $v + '" ProcessorArchitecture="x64" />')
-          '  <Properties><DisplayName>BlueFish</DisplayName><PublisherDisplayName>Miku</PublisherDisplayName><Logo>Assets\StoreLogo.png</Logo></Properties>'
-          '  <Dependencies><TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.19041.0" /></Dependencies>'
-          '  <Resources><Resource Language="en-us" /></Resources>'
-          '  <Capabilities><Capability Name="internetClient" /><rescap:Capability Name="runFullTrust" /></Capabilities>'
-          '  <Applications><Application Id="App" Executable="DeepSeek Harness.exe" EntryPoint="Windows.FullTrustApplication">'
-          '    <uap:VisualElements DisplayName="BlueFish" Description="BlueFish" BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png" />'
-          '  </Application></Applications>'
-          '</Package>'
+          'appId: com.deepseek.harness'
+          'productName: DeepSeek Harness'
+          'directories:'
+          '  output: C:\ebout'
+          'win:'
+          '  target: appx'
+          'appx:'
+          '  identityName: 14714BE0.320850A8A419A'
+          '  publisher: CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD'
+          '  publisherDisplayName: Miku'
+          '  displayName: BlueFish'
+          '  applicationId: App'
+          '  capabilities:'
+          '    - runFullTrust'
+          '    - internetClient'
+          '  languages:'
+          '    - en-US'
+          '    - zh-CN'
           )
-          [System.IO.File]::WriteAllText((Join-Path $d "AppxManifest.xml"), ($L -join "`r`n"), (New-Object System.Text.UTF8Encoding $false))
-          $a = Join-Path $d "Assets"
-          New-Item -ItemType Directory -Force -Path $a | Out-Null
-          Add-Type -AssemblyName System.Drawing
-          function I($w,$h,$o) {
-            $b = New-Object System.Drawing.Bitmap $w,$h
-            $g = [System.Drawing.Graphics]::FromImage($b)
-            $g.Clear([System.Drawing.Color]::FromArgb(58,95,170))
-            $b.Save($o, [System.Drawing.Imaging.ImageFormat]::Png)
-            $g.Dispose(); $b.Dispose()
-          }
-          I 50 50 (Join-Path $a "StoreLogo.png")
-          I 44 44 (Join-Path $a "Square44x44Logo.png")
-          I 150 150 (Join-Path $a "Square150x150Logo.png")
-          I 310 150 (Join-Path $a "Wide310x150Logo.png")
-      - name: Pack
+          [System.IO.File]::WriteAllText("$env:GITHUB_WORKSPACE\eb-appx.yml", ($L -join "`r`n"), (New-Object System.Text.UTF8Encoding $false))
+          Get-Content "$env:GITHUB_WORKSPACE\eb-appx.yml"
+      - name: Pack with electron-builder
         id: pack
         continue-on-error: true
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: |
           $d = "${{ steps.inst.outputs.appdir }}"
-          $mk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
-          New-Item -ItemType Directory -Force -Path "C:\out" | Out-Null
+          New-Item -ItemType Directory -Force -Path "C:\ebout" | Out-Null
           $sw = [System.Diagnostics.Stopwatch]::StartNew()
-          & $mk pack /d $d /p "C:\out\app.appx" /o /nc 2>&1 | Tee-Object p1.log
+          pnpm exec electron-builder --win appx --prepackaged $d --config eb-appx.yml --publish never *>&1 | Tee-Object p1.log
+          $code = $LASTEXITCODE
           $sw.Stop()
-          Write-Host "EXIT=$LASTEXITCODE  elapsed=$([math]::Round($sw.Elapsed.TotalSeconds))s"
-          if (Test-Path "C:\out\app.appx") {
-            $s = (Get-Item "C:\out\app.appx").Length
-            Write-Host "*** SUCCESS {0:N1} MB ***" -f ($s/1MB)
+          Write-Host "EXIT=$code  elapsed=$([math]::Round($sw.Elapsed.TotalSeconds))s"
+          Write-Host "=== C:\ebout ==="
+          Get-ChildItem "C:\ebout" -Recurse -ErrorAction SilentlyContinue | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,2)}} | Format-Table -AutoSize
+          $appx = Get-ChildItem "C:\ebout" -Recurse -Include *.appx,*.msix -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($appx) {
+            Write-Host "*** SUCCESS $($appx.FullName) {0:N1} MB ***" -f ($appx.Length/1MB)
             New-Item -ItemType Directory -Force -Path dist-msix | Out-Null
-            Copy-Item "C:\out\app.appx" "dist-msix\bluefish.appx" -Force
+            Copy-Item $appx.FullName "dist-msix\bluefish.appx" -Force
           } else {
             Write-Host "*** FAILED ***"
-            Get-Content p1.log -ErrorAction SilentlyContinue | Select-Object -Last 5
+            Get-Content p1.log -ErrorAction SilentlyContinue | Select-Object -Last 25
           }
       - name: Upload
         if: always()
@@ -206,7 +105,7 @@ jobs:
         with:
           name: winapp-logs
           path: |
-            s*.log
+            i*.log
             p*.log
           if-no-files-found: warn
           retention-days: 14
