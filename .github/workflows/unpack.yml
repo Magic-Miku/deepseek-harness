@@ -14,59 +14,71 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
-      - name: Download official exe
-        continue-on-error: true
+      - name: Download exe
         run: |
-          $u = "https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe"
-          Write-Host "try: $u"
-          try {
-            Invoke-WebRequest -Uri $u -OutFile "dsh.exe" -MaximumRedirection 10 -TimeoutSec 900 -UseBasicParsing
-            $len = (Get-Item dsh.exe).Length
-            Write-Host "OK $len bytes"
-            $h = (Get-FileHash dsh.exe -Algorithm SHA256).Hash
-            Write-Host "SHA256 = $h"
-          } catch {
-            Write-Host "FAILED: $($_.Exception.Message)"
-          }
-      - name: Find and extract with 7z
-        continue-on-error: true
+          curl.exe -L --retry 3 --retry-delay 5 --max-time 1800 -o dsh.exe "https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe"
+          $s = (Get-Item dsh.exe).Length
+          Write-Host "downloaded = $s bytes"
+          if ($s -lt 200MB) { throw "download too small" }
+      - name: Extract layer 1
         run: |
-          if (-not (Test-Path dsh.exe)) { Write-Host "NO EXE"; exit }
           $z = "C:\Program Files\7-Zip\7z.exe"
-          Write-Host "7z exists: $(Test-Path $z)"
-          if (-not (Test-Path $z)) {
-            $c = Get-Command 7z -ErrorAction SilentlyContinue
-            if ($c) { $z = $c.Source }
-          }
-          Write-Host "using 7z: $z"
-          if (Test-Path "D:\u") { Remove-Item "D:\u" -Recurse -Force -ErrorAction SilentlyContinue }
-          New-Item -ItemType Directory -Force -Path "D:\u" | Out-Null
-          & $z x dsh.exe -o"D:\u" -y 2>&1 | Tee-Object u1.log
+          New-Item -ItemType Directory -Force -Path "D:\L1" | Out-Null
+          & $z x dsh.exe -o"D:\L1" -y 2>&1 | Tee-Object a1.log
           Write-Host "EXIT=$LASTEXITCODE"
-      - name: Inspect
+          Get-ChildItem "D:\L1" -Recurse -File | Select-Object FullName, Length | Format-Table -AutoSize
+      - name: Find inner 7z
+        id: inner
+        run: |
+          $log = "a2.log"
+          "=== L1 里所有文件（按大小）===" | Out-File $log
+          Get-ChildItem "D:\L1" -Recurse -File | Sort-Object Length -Descending |
+            Select-Object -First 20 FullName, Length | Format-Table -AutoSize | Out-String | Out-File $log -Append
+          "" | Out-File $log -Append
+          "=== 找 7z 扩展名 ===" | Out-File $log -Append
+          Get-ChildItem "D:\L1" -Recurse -File -Include *.7z,*.7z.* -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty FullName | Out-File $log -Append
+          "" | Out-File $log -Append
+          "=== 找 >10MB 的任何文件 ===" | Out-File $log -Append
+          $big = Get-ChildItem "D:\L1" -Recurse -File | Where-Object { $_.Length -gt 10MB } | Sort-Object Length -Descending
+          $big | Select-Object FullName, Length | Format-Table -AutoSize | Out-String | Out-File $log -Append
+          if ($big.Count -gt 0) { "inner=$($big[0].FullName)" | Out-File -Append $env:GITHUB_OUTPUT }
+          Get-Content $log
+      - name: Extract layer 2
+        id: L2
+        continue-on-error: true
+        run: |
+          $inner = "${{ steps.inner.outputs.inner }}"
+          if (-not $inner) { Write-Host "no inner archive"; exit }
+          Write-Host "inner = $inner"
+          $z = "C:\Program Files\7-Zip\7z.exe"
+          New-Item -ItemType Directory -Force -Path "D:\L2" | Out-Null
+          & $z x $inner -o"D:\L2" -y 2>&1 | Tee-Object a3.log
+          Write-Host "EXIT=$LASTEXITCODE"
+          Get-ChildItem "D:\L2" | Select-Object Name | Format-Table -AutoSize
+      - name: Inspect L2
         if: always()
         run: |
-          $log = "u2.log"
-          "=== top level ===" | Out-File $log
-          Get-ChildItem "D:\u" -ErrorAction SilentlyContinue | Select-Object Name | Format-Table -AutoSize | Out-String | Out-File $log -Append
+          $log = "a4.log"
+          "=== L2 顶层 ===" | Out-File $log
+          Get-ChildItem "D:\L2" -ErrorAction SilentlyContinue | Select-Object Name | Format-Table -AutoSize | Out-String | Out-File $log -Append
           "" | Out-File $log -Append
-          "=== DeepSeek Harness.exe ===" | Out-File $log -Append
-          Get-ChildItem "D:\u" -Recurse -Filter "DeepSeek Harness.exe" -ErrorAction SilentlyContinue | Select-Object -First 3 -ExpandProperty FullName | Out-File $log -Append
+          "=== 找 DeepSeek Harness.exe ===" | Out-File $log -Append
+          Get-ChildItem "D:\L2" -Recurse -Filter "DeepSeek Harness.exe" -ErrorAction SilentlyContinue | Select-Object -First 3 -ExpandProperty FullName | Out-File $log -Append
           "" | Out-File $log -Append
-          "=== app.asar ===" | Out-File $log -Append
-          Get-ChildItem "D:\u" -Recurse -Filter "app.asar" -ErrorAction SilentlyContinue | Select-Object -First 3 -ExpandProperty FullName | Out-File $log -Append
+          "=== 找 app.asar ===" | Out-File $log -Append
+          Get-ChildItem "D:\L2" -Recurse -Filter "app.asar" -ErrorAction SilentlyContinue | Select-Object -First 3 -ExpandProperty FullName | Out-File $log -Append
           "" | Out-File $log -Append
-          "files=" + (Get-ChildItem "D:\u" -Recurse -File -ErrorAction SilentlyContinue).Count | Out-File $log -Append
+          "files=" + (Get-ChildItem "D:\L2" -Recurse -File -ErrorAction SilentlyContinue).Count | Out-File $log -Append
           "" | Out-File $log -Append
           "=== bracket files ===" | Out-File $log -Append
-          Get-ChildItem "D:\u" -Recurse -File -Force -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match '\[|\]' } |
-            Select-Object -First 10 -ExpandProperty FullName | Out-File $log -Append
+          Get-ChildItem "D:\L2" -Recurse -File -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '\[|\]' } | Select-Object -First 10 -ExpandProperty FullName | Out-File $log -Append
           Get-Content $log
       - name: Pack MSIX
         continue-on-error: true
         run: |
-          $exe = Get-ChildItem "D:\u" -Recurse -Filter "DeepSeek Harness.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          $exe = Get-ChildItem "D:\L2" -Recurse -Filter "DeepSeek Harness.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $exe) { Write-Host "NO APP EXE"; exit }
           $appdir = $exe.Directory.FullName
           Write-Host "appdir = $appdir"
@@ -84,7 +96,6 @@ jobs:
           I 150 150 "$appdir\Assets\Square150x150Logo.png"
           I 310 150 "$appdir\Assets\Wide310x150Logo.png"
           $v = "1.0.$env:GITHUB_RUN_NUMBER.0"
-          Write-Host "version = $v"
           $x = @(
           '<?xml version="1.0" encoding="utf-8"?>'
           '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap rescap">'
@@ -99,18 +110,15 @@ jobs:
           '</Package>'
           )
           [System.IO.File]::WriteAllText("$appdir\AppxManifest.xml", ($x -join "`r`n"), (New-Object System.Text.UTF8Encoding $false))
-          Write-Host "=== remove bracket files ==="
           $bad = Get-ChildItem $appdir -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '\[|\]' }
-          $bad | ForEach-Object { Write-Host ("REMOVE: " + $_.FullName) }
+          Write-Host "bracket files = $($bad.Count)"
           $bad | Remove-Item -Force -ErrorAction SilentlyContinue
-          Write-Host "removed = $($bad.Count)"
           $mk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
           New-Item -ItemType Directory -Force -Path "D:\o" | Out-Null
           & $mk pack /d $appdir /p "D:\o\bf.appx" /o /nc 2>&1 | Tee-Object p1.log
           Write-Host "EXIT=$LASTEXITCODE"
           if (Test-Path "D:\o\bf.appx") {
-            $s = (Get-Item "D:\o\bf.appx").Length
-            Write-Host "*** APPX OK $s bytes ***"
+            Write-Host "*** APPX OK ***"
             New-Item -ItemType Directory -Force -Path dist-msix | Out-Null
             Copy-Item "D:\o\bf.appx" "dist-msix\bluefish.appx" -Force
           } else {
@@ -131,7 +139,7 @@ jobs:
         with:
           name: unpack-logs
           path: |
-            u*.log
+            a*.log
             p*.log
           if-no-files-found: warn
           retention-days: 14
