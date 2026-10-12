@@ -1,0 +1,23 @@
+appId: com.deepseek.harness
+# 必须是 DeepSeek Harness：决定 appx manifest 里的 Executable 路径
+productName: DeepSeek Harness
+copyright: Copyright © 2026
+directories:
+  output: dist-msix
+win:
+  target: appx
+appx:
+  identityName: 14714BE0.320850A8A419A
+  publisher: CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD
+  publisherDisplayName: 𝕸ikน神教✨教主
+  displayName: 蓝色大肥鱼
+  applicationId: App
+  capabilities:
+    - runFullTrust
+    - internetClient
+  languages:
+    - zh-CN
+    - en-US
+  minVersion: 10.0.17763.0
+  maxVersionTested: 10.0.22621.0
+  backgroundColor: '#2c2c2c'
