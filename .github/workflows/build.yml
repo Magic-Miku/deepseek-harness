@@ -1,129 +1,162 @@
-name: MSIX Diagnose
+name: Package MSIX
 on:
   workflow_dispatch:
+    inputs:
+      appx_version:
+        type: string
+        default: 'auto'
+        required: true
+permissions:
+  contents: write
 jobs:
-  diag:
+  build:
     runs-on: windows-2022
-    timeout-minutes: 20
+    timeout-minutes: 120
     defaults:
       run:
         shell: pwsh
     steps:
       - uses: actions/checkout@v4
-      - name: Make fake app
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.28.5
+          run_install: false
+      - name: Clean env
+        continue-on-error: true
         run: |
-          $root = "$PWD\fakeapp"
-          New-Item -ItemType Directory -Force -Path "$root\Assets" | Out-Null
-          [System.IO.File]::WriteAllBytes("$root\MyApp.exe", (New-Object byte[] 1024))
+          if (Test-Path "apps/desktop/.env.windows") { Remove-Item "apps/desktop/.env.windows" -Force }
+      - name: Install
+        id: install
+        continue-on-error: true
+        run: |
+          pnpm install --frozen-lockfile *>&1 | Tee-Object b1.log
+          exit $LASTEXITCODE
+      - name: Prepare
+        id: prep
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        env:
+          PACKAGE_BUILD_VERSION: auto
+          PACKAGE_DEPLOYMENT: test
+          PACKAGE_POLICY_ORIGIN: https://example.invalid
+          PACKAGE_LOGIN_ORIGINS: https://example.invalid
+        run: |
+          pnpm exec tsx apps/desktop/scripts/prepare-windows-ci.mjs *>&1 | Tee-Object b2.log
+      - name: Build dir
+        id: dir
+        if: steps.prep.outcome == 'success'
+        continue-on-error: true
+        env:
+          PACKAGE_VERSION: ${{ steps.prep.outputs.version }}
+        run: |
+          Push-Location apps/desktop
+          pnpm exec tsx scripts/package-target.ts win-x64 --unsigned --dir --build-version "$env:PACKAGE_VERSION" *>&1 | Tee-Object ..\..\b3.log
+          Pop-Location
+      - name: Move to SHORT path
+        id: mv
+        if: steps.dir.outcome == 'success'
+        run: |
+          $root = "apps/desktop/.desktop-build"
+          $c = Get-ChildItem $root -Directory -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { Test-Path (Join-Path $_.FullName "DeepSeek Harness.exe") } | Select-Object -First 1
+          if (-not $c) { throw "app dir not found" }
+          Write-Host "source = $($c.FullName)"
+          $short = "D:\p"
+          if (Test-Path $short) { Remove-Item $short -Recurse -Force -ErrorAction SilentlyContinue }
+          New-Item -ItemType Directory -Force -Path $short | Out-Null
+          Write-Host "copying to $short ..."
+          Copy-Item -Path (Join-Path $c.FullName "*") -Destination $short -Recurse -Force
+          $n = (Get-ChildItem $short -Recurse -File -ErrorAction SilentlyContinue).Count
+          Write-Host "copied files: $n"
+          "short=$short" | Out-File -Append $env:GITHUB_OUTPUT
+      - name: Icons
+        if: steps.mv.outcome == 'success'
+        run: |
+          $s = "${{ steps.mv.outputs.short }}"
+          New-Item -ItemType Directory -Force -Path "$s\Assets" | Out-Null
           Add-Type -AssemblyName System.Drawing
-          function New-Icon($w,$h,$out) {
+          function I($w,$h,$o) {
             $b = New-Object System.Drawing.Bitmap $w,$h
             $g = [System.Drawing.Graphics]::FromImage($b)
             $g.Clear([System.Drawing.Color]::FromArgb(58,95,170))
-            $b.Save($out, [System.Drawing.Imaging.ImageFormat]::Png)
+            $b.Save($o, [System.Drawing.Imaging.ImageFormat]::Png)
             $g.Dispose(); $b.Dispose()
           }
-          New-Icon 50 50 "$root\Assets\StoreLogo.png"
-          New-Icon 44 44 "$root\Assets\Square44x44Logo.png"
-          New-Icon 150 150 "$root\Assets\Square150x150Logo.png"
-          New-Icon 310 150 "$root\Assets\Wide310x150Logo.png"
-          Write-Host "fake app ready"
-      - name: Find makeappx
-        id: mk
+          I 50 50 "$s\Assets\StoreLogo.png"
+          I 44 44 "$s\Assets\Square44x44Logo.png"
+          I 150 150 "$s\Assets\Square150x150Logo.png"
+          I 310 150 "$s\Assets\Wide310x150Logo.png"
+          Get-ChildItem "$s\Assets" | Select-Object Name, Length | Format-Table -AutoSize
+      - name: Version
+        id: ver
         run: |
-          $k = "C:\Program Files (x86)\Windows Kits\10\bin"
-          $a = Get-ChildItem -Path $k -Filter makeappx.exe -Recurse -ErrorAction SilentlyContinue
-          "found=$($a.Count)" | Out-File d0.log
-          $a | ForEach-Object { $_.FullName } | Out-File d0.log -Append
-          $x = $a | Where-Object { $_.FullName -match "\\x64\\" } | Sort-Object FullName -Descending | Select-Object -First 1
-          if (-not $x) { $x = $a | Sort-Object FullName -Descending | Select-Object -First 1 }
-          if ($x) { "mk=$($x.FullName)" | Out-File -Append $env:GITHUB_OUTPUT } else { "mk=" | Out-File -Append $env:GITHUB_OUTPUT }
-          Get-Content d0.log
-      - name: T1 uap10 template
-        continue-on-error: true
+          $v = "${{ inputs.appx_version }}"
+          if ($v -eq 'auto') { $v = "1.0.$env:GITHUB_RUN_NUMBER.0" }
+          "version=$v" | Out-File -Append $env:GITHUB_OUTPUT
+          Write-Host "version = $v"
+      - name: Manifest
+        if: steps.mv.outcome == 'success'
         run: |
-          $r = "$PWD\fakeapp"
-          $x = @(
-          '<?xml version="1.0" encoding="utf-8"?>'
-          '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap uap10 rescap">'
-          '  <Identity Name="14714BE0.320850A8A419A" Version="1.0.1.0" Publisher="CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" ProcessorArchitecture="x64" />'
-          '  <Properties><DisplayName>BlueFish</DisplayName><PublisherDisplayName>Miku</PublisherDisplayName><Logo>Assets\StoreLogo.png</Logo></Properties>'
-          '  <Resources><Resource Language="en-us" /></Resources>'
-          '  <Dependencies><TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22621.0" /></Dependencies>'
-          '  <Capabilities><rescap:Capability Name="runFullTrust" /></Capabilities>'
-          '  <Applications><Application Id="App" Executable="MyApp.exe" uap10:RuntimeBehavior="packagedClassicApp" uap10:TrustLevel="mediumIL">'
-          '    <uap:VisualElements DisplayName="BlueFish" Description="BlueFish" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png" BackgroundColor="transparent" />'
-          '  </Application></Applications>'
-          '</Package>'
-          )
-          [System.IO.File]::WriteAllText("$r\AppxManifest.xml", ($x -join "`r`n"), (New-Object System.Text.UTF8Encoding $false))
-          New-Item -ItemType Directory -Force -Path out1 | Out-Null
-          & "${{ steps.mk.outputs.mk }}" pack /d $r /p "out1\t1.appx" /o /nc *>&1 | Out-File d1.log
-          "EXIT=$LASTEXITCODE" | Out-File d1.log -Append
-          if (Test-Path out1\t1.appx) { "RESULT=OK $((Get-Item out1\t1.appx).Length)" | Out-File d1.log -Append } else { "RESULT=NOFILE" | Out-File d1.log -Append }
-          Get-Content d1.log | Select-Object -Last 12
-      - name: T2 EntryPoint style
-        continue-on-error: true
-        run: |
-          $r = "$PWD\fakeapp"
+          $s = "${{ steps.mv.outputs.short }}"
+          $v = "${{ steps.ver.outputs.version }}"
           $x = @(
           '<?xml version="1.0" encoding="utf-8"?>'
           '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap rescap">'
-          '  <Identity Name="14714BE0.320850A8A419A" Version="1.0.1.0" Publisher="CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" ProcessorArchitecture="x64" />'
+          ('  <Identity Name="14714BE0.320850A8A419A" Version="' + $v + '" Publisher="CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" ProcessorArchitecture="x64" />')
           '  <Properties><DisplayName>BlueFish</DisplayName><PublisherDisplayName>Miku</PublisherDisplayName><Logo>Assets\StoreLogo.png</Logo></Properties>'
           '  <Resources><Resource Language="en-us" /></Resources>'
           '  <Dependencies><TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22621.0" /></Dependencies>'
-          '  <Capabilities><rescap:Capability Name="runFullTrust" /></Capabilities>'
-          '  <Applications><Application Id="App" Executable="MyApp.exe" EntryPoint="Windows.FullTrustApplication">'
+          '  <Capabilities><rescap:Capability Name="runFullTrust" /><Capability Name="internetClient" /></Capabilities>'
+          '  <Applications><Application Id="App" Executable="DeepSeek Harness.exe" EntryPoint="Windows.FullTrustApplication">'
           '    <uap:VisualElements DisplayName="BlueFish" Description="BlueFish" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png" BackgroundColor="transparent" />'
           '  </Application></Applications>'
           '</Package>'
           )
-          [System.IO.File]::WriteAllText("$r\AppxManifest.xml", ($x -join "`r`n"), (New-Object System.Text.UTF8Encoding $false))
-          New-Item -ItemType Directory -Force -Path out2 | Out-Null
-          & "${{ steps.mk.outputs.mk }}" pack /d $r /p "out2\t2.appx" /o /nc *>&1 | Out-File d2.log
-          "EXIT=$LASTEXITCODE" | Out-File d2.log -Append
-          if (Test-Path out2\t2.appx) { "RESULT=OK $((Get-Item out2\t2.appx).Length)" | Out-File d2.log -Append } else { "RESULT=NOFILE" | Out-File d2.log -Append }
-          Get-Content d2.log | Select-Object -Last 12
-      - name: T3 no validate
+          [System.IO.File]::WriteAllText("$s\AppxManifest.xml", ($x -join "`r`n"), (New-Object System.Text.UTF8Encoding $false))
+          Write-Host "manifest written"
+      - name: PACK
+        id: pack
+        if: steps.mv.outcome == 'success'
         continue-on-error: true
         run: |
-          New-Item -ItemType Directory -Force -Path out3 | Out-Null
-          & "${{ steps.mk.outputs.mk }}" pack /d "$PWD\fakeapp" /p "out3\t3.appx" /o /nc /nv *>&1 | Out-File d3.log
-          "EXIT=$LASTEXITCODE" | Out-File d3.log -Append
-          if (Test-Path out3\t3.appx) { "RESULT=OK $((Get-Item out3\t3.appx).Length)" | Out-File d3.log -Append } else { "RESULT=NOFILE" | Out-File d3.log -Append }
-          Get-Content d3.log | Select-Object -Last 12
-      - name: T4 eb verbose
-        continue-on-error: true
+          $s = "${{ steps.mv.outputs.short }}"
+          $mk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
+          New-Item -ItemType Directory -Force -Path "D:\o" | Out-Null
+          Push-Location "D:\"
+          & $mk pack /d "p" /p "o\bf.appx" /o /nc *>&1 | Tee-Object ..\b4.log
+          $code = $LASTEXITCODE
+          "EXIT=$code" | Tee-Object -Append ..\b4.log
+          Pop-Location
+          if (Test-Path "D:\o\bf.appx") {
+            $sz = (Get-Item "D:\o\bf.appx").Length
+            Write-Host "APPX OK $sz bytes"
+            New-Item -ItemType Directory -Force -Path dist-msix | Out-Null
+            Copy-Item "D:\o\bf.appx" "dist-msix\bluefish.appx" -Force
+          } else {
+            Write-Host "APPX MISSING"
+          }
+      - name: Show logs
+        if: always()
         run: |
-          $c = @(
-          'appId: com.deepseek.harness'
-          'productName: MyApp'
-          'directories:'
-          '  output: dist-eb'
-          'win:'
-          '  target: appx'
-          'appx:'
-          '  identityName: 14714BE0.320850A8A419A'
-          '  publisher: CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD'
-          '  publisherDisplayName: Miku'
-          '  displayName: BlueFish'
-          '  applicationId: App'
-          '  capabilities:'
-          '    - runFullTrust'
-          '  languages:'
-          '    - en-US'
-          )
-          [System.IO.File]::WriteAllText("eb.yml", ($c -join "`r`n"), (New-Object System.Text.UTF8Encoding $false))
-          pnpm exec electron-builder --win appx --prepackaged "$PWD\fakeapp" --config eb.yml --publish never *>&1 | Out-File d4.log
-          "EXIT=$LASTEXITCODE" | Out-File d4.log -Append
-          Get-Content d4.log | Select-Object -Last 30
-      - name: Save logs
+          if (Test-Path b4.log) { Get-Content b4.log | Select-Object -Last 30 }
+      - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: diagnose-logs
-          path: |
-            d*.log
-            eb.yml
+          name: dsh-msix
+          path: dist-msix/*.appx
           if-no-files-found: warn
+          retention-days: 30
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: b*.log
+          if-no-files-found: warn
+          retention-days: 14
