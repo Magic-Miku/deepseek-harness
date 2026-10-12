@@ -19,10 +19,8 @@ jobs:
         continue-on-error: true
       - name: Verify winapp
         run: |
-          Write-Host "=== which winapp ==="
           Get-Command winapp -ErrorAction SilentlyContinue | Select-Object Source
-          Write-Host "=== winapp --help ==="
-          winapp --help 2>&1 | Select-Object -First 30
+          winapp --help 2>&1 | Select-Object -First 15
           Write-Host "EXIT=$LASTEXITCODE"
       - name: Download exe
         run: |
@@ -47,7 +45,7 @@ jobs:
           Write-Host "EXIT=$LASTEXITCODE"
           $n = (Get-ChildItem "D:\L2" -Recurse -File -ErrorAction SilentlyContinue).Count
           Write-Host "files = $n"
-      - name: Remove bracket files via dotnet
+      - name: Remove bracket files
         if: always()
         run: |
           $log = "a5.log"
@@ -78,26 +76,50 @@ jobs:
           }
           "removed = $removed" | Out-File $log -Append
           Get-Content $log
+      - name: Set manifest dir
+        id: setdir
+        run: |
+          $exe = Get-ChildItem "D:\L2" -Recurse -Filter "DeepSeek Harness.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) { throw "app exe not found" }
+          Write-Host "exe = $($exe.FullName)"
+          Write-Host "dir = $($exe.Directory.FullName)"
+          "appdir=$($exe.Directory.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
+          "exepath=$($exe.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
       - name: Manifest generate
         continue-on-error: true
         run: |
-          winapp manifest generate "D:\L2" --package-name "14714BE0.320850A8A419A" --publisher-name "CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" --version "1.0.$env:GITHUB_RUN_NUMBER.0" --entrypoint "DeepSeek Harness.exe" --if-exists Overwrite 2>&1 | Tee-Object m1.log
+          $d = "${{ steps.setdir.outputs.appdir }}"
+          $e = "${{ steps.setdir.outputs.exepath }}"
+          $v = "1.0.$env:GITHUB_RUN_NUMBER.0"
+          Write-Host "dir=$d"
+          Write-Host "exe=$e"
+          Write-Host "ver=$v"
+          Push-Location $d
+          winapp manifest generate . --package-name "14714BE0.320850A8A419A" --publisher-name "CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" --version $v --entrypoint $e --logo-path "Assets\StoreLogo.png" --if-exists Overwrite 2>&1 | Tee-Object "D:\m1.log"
           Write-Host "EXIT=$LASTEXITCODE"
+          Pop-Location
+          Write-Host "=== files in appdir ==="
+          Get-ChildItem $d -Filter "*.appxmanifest" -ErrorAction SilentlyContinue | Select-Object Name
+          Get-ChildItem $d -Filter "*.xml" -ErrorAction SilentlyContinue | Select-Object Name
       - name: Show manifest
         if: always()
         run: |
-          if (Test-Path "D:\L2\Package.appxmanifest") {
-            Write-Host "=== manifest ==="
-            Get-Content "D:\L2\Package.appxmanifest" | Select-Object -First 40
+          $d = "${{ steps.setdir.outputs.appdir }}"
+          $mf = Join-Path $d "Package.appxmanifest"
+          if (Test-Path $mf) {
+            Write-Host "=== Package.appxmanifest ==="
+            Get-Content $mf
           } else {
-            Write-Host "NO MANIFEST"
+            Write-Host "NO Package.appxmanifest at $mf"
+            Get-Content "D:\m1.log" -ErrorAction SilentlyContinue
           }
       - name: Pack MSIX
         id: pack
         continue-on-error: true
         run: |
+          $d = "${{ steps.setdir.outputs.appdir }}"
           New-Item -ItemType Directory -Force -Path "D:\out" | Out-Null
-          winapp pack "D:\L2" --no-sign --output "D:\out\app.msix" 2>&1 | Tee-Object p1.log
+          winapp pack $d --no-sign --output "D:\out\app.msix" 2>&1 | Tee-Object p1.log
           Write-Host "EXIT=$LASTEXITCODE"
           if (Test-Path "D:\out\app.msix") {
             $s = (Get-Item "D:\out\app.msix").Length
@@ -107,19 +129,6 @@ jobs:
           } else {
             Write-Host "*** MSIX MISSING ***"
             Get-ChildItem "D:\out" -ErrorAction SilentlyContinue
-          }
-      - name: Fallback makeappx
-        if: steps.pack.outcome != 'success'
-        continue-on-error: true
-        run: |
-          $mk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
-          New-Item -ItemType Directory -Force -Path "D:\o" | Out-Null
-          & $mk pack /d "D:\L2" /p "D:\o\bf.appx" /o /nc 2>&1 | Tee-Object p2.log
-          Write-Host "makeappx EXIT=$LASTEXITCODE"
-          if (Test-Path "D:\o\bf.appx") {
-            New-Item -ItemType Directory -Force -Path dist-msix | Out-Null
-            Copy-Item "D:\o\bf.appx" "dist-msix\bluefish.appx" -Force
-            Write-Host "fallback OK"
           }
       - name: Upload msix
         if: always()
@@ -136,7 +145,6 @@ jobs:
           name: winapp-logs
           path: |
             a*.log
-            m*.log
             p*.log
           if-no-files-found: warn
           retention-days: 14
