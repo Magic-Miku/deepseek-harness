@@ -27,46 +27,30 @@ jobs:
           & $z x dsh.exe -o"D:\L1" -y 2>&1 | Tee-Object a1.log
           Write-Host "EXIT=$LASTEXITCODE"
           Get-ChildItem "D:\L1" -Recurse -File | Select-Object FullName, Length | Format-Table -AutoSize
-      - name: Find inner 7z
-        id: inner
-        run: |
-          $log = "a2.log"
-          "=== L1 里所有文件（按大小）===" | Out-File $log
-          Get-ChildItem "D:\L1" -Recurse -File | Sort-Object Length -Descending |
-            Select-Object -First 20 FullName, Length | Format-Table -AutoSize | Out-String | Out-File $log -Append
-          "" | Out-File $log -Append
-          "=== 找 7z 扩展名 ===" | Out-File $log -Append
-          Get-ChildItem "D:\L1" -Recurse -File -Include *.7z,*.7z.* -ErrorAction SilentlyContinue |
-            Select-Object -ExpandProperty FullName | Out-File $log -Append
-          "" | Out-File $log -Append
-          "=== 找 >10MB 的任何文件 ===" | Out-File $log -Append
-          $big = Get-ChildItem "D:\L1" -Recurse -File | Where-Object { $_.Length -gt 10MB } | Sort-Object Length -Descending
-          $big | Select-Object FullName, Length | Format-Table -AutoSize | Out-String | Out-File $log -Append
-          if ($big.Count -gt 0) { "inner=$($big[0].FullName)" | Out-File -Append $env:GITHUB_OUTPUT }
-          Get-Content $log
       - name: Extract layer 2
         id: L2
         continue-on-error: true
         run: |
-          $inner = "${{ steps.inner.outputs.inner }}"
-          if (-not $inner) { Write-Host "no inner archive"; exit }
+          $inner = "D:\L1\`$PLUGINSDIR\app-64.7z"
           Write-Host "inner = $inner"
+          Write-Host "exists = $(Test-Path $inner)"
+          if (-not (Test-Path $inner)) { Write-Host "INNER NOT FOUND"; exit }
           $z = "C:\Program Files\7-Zip\7z.exe"
           New-Item -ItemType Directory -Force -Path "D:\L2" | Out-Null
           & $z x $inner -o"D:\L2" -y 2>&1 | Tee-Object a3.log
           Write-Host "EXIT=$LASTEXITCODE"
           Get-ChildItem "D:\L2" | Select-Object Name | Format-Table -AutoSize
-      - name: Inspect L2
+      - name: Inspect
         if: always()
         run: |
           $log = "a4.log"
-          "=== L2 顶层 ===" | Out-File $log
+          "=== L2 top ===" | Out-File $log
           Get-ChildItem "D:\L2" -ErrorAction SilentlyContinue | Select-Object Name | Format-Table -AutoSize | Out-String | Out-File $log -Append
           "" | Out-File $log -Append
-          "=== 找 DeepSeek Harness.exe ===" | Out-File $log -Append
+          "=== DeepSeek Harness.exe ===" | Out-File $log -Append
           Get-ChildItem "D:\L2" -Recurse -Filter "DeepSeek Harness.exe" -ErrorAction SilentlyContinue | Select-Object -First 3 -ExpandProperty FullName | Out-File $log -Append
           "" | Out-File $log -Append
-          "=== 找 app.asar ===" | Out-File $log -Append
+          "=== app.asar ===" | Out-File $log -Append
           Get-ChildItem "D:\L2" -Recurse -Filter "app.asar" -ErrorAction SilentlyContinue | Select-Object -First 3 -ExpandProperty FullName | Out-File $log -Append
           "" | Out-File $log -Append
           "files=" + (Get-ChildItem "D:\L2" -Recurse -File -ErrorAction SilentlyContinue).Count | Out-File $log -Append
@@ -118,7 +102,8 @@ jobs:
           & $mk pack /d $appdir /p "D:\o\bf.appx" /o /nc 2>&1 | Tee-Object p1.log
           Write-Host "EXIT=$LASTEXITCODE"
           if (Test-Path "D:\o\bf.appx") {
-            Write-Host "*** APPX OK ***"
+            $s = (Get-Item "D:\o\bf.appx").Length
+            Write-Host "*** APPX OK $s bytes ***"
             New-Item -ItemType Directory -Force -Path dist-msix | Out-Null
             Copy-Item "D:\o\bf.appx" "dist-msix\bluefish.appx" -Force
           } else {
