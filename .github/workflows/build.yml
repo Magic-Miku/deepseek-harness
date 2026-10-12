@@ -3,9 +3,6 @@ name: MSIX Diagnose
 on:
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
   diagnose:
     runs-on: windows-2022
@@ -13,24 +10,9 @@ jobs:
     defaults:
       run:
         shell: pwsh
-
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 11.28.5
-          run_install: false
-
-      - name: Make a minimal fake app dir
+      - name: Make fake app
         shell: pwsh
         run: |
           $root = "$PWD\fakeapp"
@@ -49,68 +31,3 @@ jobs:
           New-Icon 150 150 "$root\Assets\Square150x150Logo.png"
           New-Icon 310 150 "$root\Assets\Wide310x150Logo.png"
           Write-Host "fake app ready"
-
-      - name: Locate makeappx
-        id: mk
-        shell: pwsh
-        run: |
-          $kits = "C:\Program Files (x86)\Windows Kits\10\bin"
-          $all = Get-ChildItem -Path $kits -Filter "makeappx.exe" -Recurse -ErrorAction SilentlyContinue
-          "found: $($all.Count)" | Out-File d0-makeappx.log
-          $all | ForEach-Object { $_.FullName } | Out-File d0-makeappx.log -Append
-          $x64 = $all | Where-Object { $_.FullName -match "\\x64\\" } | Sort-Object FullName -Descending | Select-Object -First 1
-          if (-not $x64) { $x64 = $all | Sort-Object FullName -Descending | Select-Object -First 1 }
-          if ($x64) {
-            "chosen: $($x64.FullName)" | Out-File d0-makeappx.log -Append
-            "mk=$($x64.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
-          } else {
-            "NONE FOUND" | Out-File d0-makeappx.log -Append
-          }
-          Get-Content d0-makeappx.log
-
-      - name: TEST1 official uap10 template
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          $root = "$PWD\fakeapp"
-          $L = @(
-          '<?xml version="1.0" encoding="utf-8"?>'
-          '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap uap10 rescap">'
-          '  <Identity Name="14714BE0.320850A8A419A" Version="1.0.1.0" Publisher="CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" ProcessorArchitecture="x64" />'
-          '  <Properties>'
-          '    <DisplayName>BlueFish</DisplayName>'
-          '    <PublisherDisplayName>Miku</PublisherDisplayName>'
-          '    <Logo>Assets\StoreLogo.png</Logo>'
-          '  </Properties>'
-          '  <Resources>'
-          '    <Resource Language="en-us" />'
-          '  </Resources>'
-          '  <Dependencies>'
-          '    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22621.0" />'
-          '  </Dependencies>'
-          '  <Capabilities>'
-          '    <rescap:Capability Name="runFullTrust" />'
-          '  </Capabilities>'
-          '  <Applications>'
-          '    <Application Id="App" Executable="MyApp.exe" uap10:RuntimeBehavior="packagedClassicApp" uap10:TrustLevel="mediumIL">'
-          '      <uap:VisualElements DisplayName="BlueFish" Description="BlueFish" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png" BackgroundColor="transparent" />'
-          '    </Application>'
-          '  </Applications>'
-          '</Package>'
-          )
-          [System.IO.File]::WriteAllText("$root\AppxManifest.xml", ($L -join "`r`n"), (New-Object System.Text.UTF8Encoding $false))
-          New-Item -ItemType Directory -Force -Path "out1" | Out-Null
-          & "${{ steps.mk.outputs.mk }}" pack /d $root /p "out1\t1.appx" /o /nc *>&1 | Out-File d1-test1.log
-          "EXIT=$LASTEXITCODE" | Out-File d1-test1.log -Append
-          if (Test-Path "out1\t1.appx") { "RESULT=OK  $((Get-Item 'out1\t1.appx').Length) bytes" | Out-File d1-test1.log -Append } else { "RESULT=NO FILE" | Out-File d1-test1.log -Append }
-          Get-Content d1-test1.log | Select-Object -Last 15
-
-      - name: TEST2 EntryPoint old style
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          $root = "$PWD\fakeapp"
-          $L = @(
-          '<?xml version="1.0" encoding="utf-8"?>'
-          '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap rescap">'
-          '  <Identity Name="14714BE0.320
