@@ -1,6 +1,10 @@
 name: DSH MSIX Probe
 
 on:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/msix-probe.yml'
   workflow_dispatch:
 
 permissions:
