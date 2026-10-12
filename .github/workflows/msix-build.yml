@@ -39,6 +39,7 @@ jobs:
       # 官方脚本用 flag:'wx' 写 .env.windows——文件已存在会报错，先删掉
       - name: Remove stale .env.windows
         shell: pwsh
+        continue-on-error: true
         run: |
           if (Test-Path "apps/desktop/.env.windows") {
             Remove-Item "apps/desktop/.env.windows" -Force
@@ -48,20 +49,26 @@ jobs:
       # 与官方 windows-package.yml 一致的调用方式
       - name: Prepare package settings
         id: settings
+        continue-on-error: true
         env:
           PACKAGE_BUILD_VERSION: ${{ inputs.build_version }}
           PACKAGE_DEPLOYMENT: test
           PACKAGE_POLICY_ORIGIN: https://example.invalid
           PACKAGE_LOGIN_ORIGINS: https://example.invalid
-        run: node apps/desktop/scripts/prepare-windows-ci.mjs
+        run: |
+          node apps/desktop/scripts/prepare-windows-ci.mjs *>&1 | Tee-Object -FilePath b0-prepare.log
+          "EXIT=$LASTEXITCODE" | Tee-Object -Append -FilePath b0-prepare.log
 
       - name: Show generated version
+        if: always()
         shell: pwsh
         run: |
-          Write-Host "PACKAGE_VERSION = ${{ steps.settings.outputs.version }}"
+          "version = ${{ steps.settings.outputs.version }}" | Out-File b0-version.log -Append
+          Get-Content b0-version.log
 
       - name: Install dependencies
         id: install
+        if: steps.settings.outcome == 'success'
         continue-on-error: true
         run: |
           pnpm install --frozen-lockfile *>&1 | Tee-Object -FilePath b1-install.log
@@ -87,6 +94,7 @@ jobs:
         id: locate
         if: steps.dir.outcome == 'success'
         shell: pwsh
+        continue-on-error: true
         run: |
           $log = "b3-locate.log"
           $root = "apps/desktop/.desktop-build"
@@ -99,11 +107,12 @@ jobs:
               Select-Object -First 1
           }
           if (-not $dir) {
-            Get-Content $log
-            throw "找不到已打包的 app 目录"
+            "NOT FOUND" | Out-File $log -Append
+          } else {
+            "apdir=$($dir.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
+            Write-Host "APP DIR = $($dir.FullName)"
           }
-          "apdir=$($dir.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
-          Write-Host "APP DIR = $($dir.FullName)"
+          Get-Content $log
 
       # ② 用我们独立的配置打成 appx
       - name: Build appx via prepackaged
@@ -152,3 +161,16 @@ jobs:
           path: b*.log
           if-no-files-found: warn
           retention-days: 14
+
+      # ★ 新增：把日志推到 probe-logs 分支，便于读取具体报错
+      - name: Commit logs to probe-logs
+        if: always()
+        shell: bash
+        continue-on-error: true
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan probe-logs 2>/dev/null || git checkout probe-logs
+          git add -f b*.log 2>/dev/null || true
+          git commit -m "msix build logs run ${{ github.run_id }}" || echo "nothing"
+          git push -f origin probe-logs || echo "push failed"
