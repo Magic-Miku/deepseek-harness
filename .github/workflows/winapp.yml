@@ -1,6 +1,12 @@
 name: WinApp Pack
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'cleanup level: light / medium / heavy'
+        type: choice
+        options: [light, medium, heavy]
+        default: medium
 permissions:
   contents: write
 jobs:
@@ -12,61 +18,109 @@ jobs:
         shell: pwsh
     steps:
       - uses: actions/checkout@v4
-      - name: Free disk and show memory
-        run: |
-          Write-Host "=== 内存 ==="
-          $cs = Get-CimInstance Win32_ComputerSystem
-          "TotalPhysicalMemory = {0:N1} GB" -f ($cs.TotalPhysicalMemory/1GB)
-          Write-Host "=== 磁盘 ==="
-          Get-PSDrive C | Select-Object @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}}, @{n='UsedGB';e={[math]::Round($_.Used/1GB,1)}} | Format-Table -AutoSize
       - name: Silent install
         id: inst
         run: |
           $tmp = "$env:RUNNER_TEMP\dsh.exe"
           curl.exe -L --retry 3 --max-time 1800 -o $tmp "https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe"
-          $s = (Get-Item $tmp).Length
-          Write-Host "downloaded = $s"
-          if ($s -lt 200MB) { throw "download too small" }
+          if ((Get-Item $tmp).Length -lt 200MB) { throw "download too small" }
           $target = "C:\DSHApp"
           New-Item -ItemType Directory -Force -Path $target | Out-Null
           $p = Start-Process -FilePath $tmp -ArgumentList "/S", "/D=$target" -Wait -PassThru
           Write-Host "installer exit = $($p.ExitCode)"
           Start-Sleep -Seconds 6
-          $n = (Get-ChildItem $target -Recurse -File -ErrorAction SilentlyContinue).Count
-          Write-Host "installed files = $n"
           $exe = Get-ChildItem $target -Recurse -Filter "DeepSeek Harness.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $exe) { throw "app exe not found" }
           Write-Host "appdir = $($exe.Directory.FullName)"
           "appdir=$($exe.Directory.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
-      - name: Slim down - remove big chunks
-        id: slim
+      - name: Cleanup
+        id: clean
         run: |
           $d = "${{ steps.inst.outputs.appdir }}"
-          $log = "s0-slim.log"
-          "=== 删除前的规模 ===" | Out-File $log
+          $mode = "${{ inputs.mode }}"
+          $log = "s0-clean.log"
+          "mode = $mode" | Out-File $log
           $before = Get-ChildItem $d -Recurse -File -ErrorAction SilentlyContinue
-          "files=$($before.Count)  size={0:N1} MB" -f (($before | Measure-Object Length -Sum).Sum/1MB) | Out-File $log -Append
+          "BEFORE: files=$($before.Count)  size={0:N1} MB" -f (($before | Measure-Object Length -Sum).Sum/1MB) | Out-File $log -Append
           "" | Out-File $log -Append
 
-          # 逐个删除大块，观察规模
-          $targets = @(
-            "resources\runtime\primary-runtime\dependencies\python",
-            "resources\app.asar.unpacked\dsh\node_modules\@deepseek-ai\libreoffice-kit-win32-x64",
-            "resources\runtime\pnpm"
-          )
-          foreach ($t in $targets) {
-            $full = Join-Path $d $t
-            if (Test-Path $full) {
-              $sz = (Get-ChildItem $full -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
-              $cnt = (Get-ChildItem $full -Recurse -File -ErrorAction SilentlyContinue).Count
-              "REMOVE: $t  ($cnt files, {0:N1} MB)" -f ($sz/1MB) | Out-File $log -Append
-              Remove-Item $full -Recurse -Force -ErrorAction SilentlyContinue
+          # ---- 1. 所有 __pycache__ / *.pyc（编译缓存，运行时自动重建）----
+          $pyc = Get-ChildItem $d -Directory -Recurse -Force -Filter "__pycache__" -ErrorAction SilentlyContinue
+          $n1 = 0
+          foreach ($x in $pyc) {
+            $n1 += (Get-ChildItem $x.FullName -Recurse -File -ErrorAction SilentlyContinue).Count
+            Remove-Item $x.FullName -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          "REMOVED __pycache__ dirs=$($pyc.Count)  files=$n1" | Out-File $log -Append
+
+          # ---- 2. Python 的 tests / test 目录 ----
+          $td = Get-ChildItem $d -Directory -Recurse -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -in @("tests","test") -and $_.FullName -match "site-packages" }
+          $n2 = 0
+          foreach ($x in $td) {
+            $n2 += (Get-ChildItem $x.FullName -Recurse -File -ErrorAction SilentlyContinue).Count
+            Remove-Item $x.FullName -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          "REMOVED test dirs=$($td.Count)  files=$n2" | Out-File $log -Append
+
+          # ---- 3. libreoffice 源码 patch（编译用，运行不需要）----
+          $pt = Get-ChildItem $d -Recurse -File -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -eq ".patch" -or $_.Extension -eq ".diff" }
+          $n3 = 0
+          foreach ($x in $pt) { Remove-Item $x.FullName -Force -ErrorAction SilentlyContinue; $n3++ }
+          "REMOVED patch/diff files=$n3" | Out-File $log -Append
+
+          if ($mode -in @("medium","heavy")) {
+            # ---- 4. Python 的 docs / examples / *.dist-info/RECORD ----
+            $dd = Get-ChildItem $d -Directory -Recurse -Force -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -in @("docs","doc","examples","example","demos") -and $_.FullName -match "site-packages" }
+            $n4 = 0
+            foreach ($x in $dd) {
+              $n4 += (Get-ChildItem $x.FullName -Recurse -File -ErrorAction SilentlyContinue).Count
+              Remove-Item $x.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            "REMOVED doc dirs=$($dd.Count)  files=$n4" | Out-File $log -Append
+
+            # ---- 5. *.pyi 类型存根（运行时不用）----
+            $pyi = Get-ChildItem $d -Recurse -File -Force -Filter "*.pyi" -ErrorAction SilentlyContinue
+            $n5 = 0
+            foreach ($x in $pyi) { Remove-Item $x.FullName -Force -ErrorAction SilentlyContinue; $n5++ }
+            "REMOVED *.pyi files=$n5" | Out-File $log -Append
+
+            # ---- 6. pip 内置（我们有独立 python，不需要 pip 完整体）----
+            $pip = Get-ChildItem $d -Directory -Recurse -Force -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -eq "_vendor" -and $_.FullName -match "\\pip\\" }
+            $n6 = 0
+            foreach ($x in $pip) {
+              $n6 += (Get-ChildItem $x.FullName -Recurse -File -ErrorAction SilentlyContinue).Count
+              Remove-Item $x.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            "REMOVED pip _vendor dirs=$($pip.Count)  files=$n6" | Out-File $log -Append
+          }
+
+          if ($mode -eq "heavy") {
+            # ---- 7. libreoffice 的 program 下非必要资源 ----
+            $lo = Join-Path $d "resources\app.asar.unpacked\dsh\node_modules\@deepseek-ai\libreoffice-kit-win32-x64\program"
+            foreach ($sub in @("presets","wizards")) {
+              $full = Join-Path $lo $sub
+              if (Test-Path $full) {
+                $c = (Get-ChildItem $full -Recurse -File -ErrorAction SilentlyContinue).Count
+                Remove-Item $full -Recurse -Force -ErrorAction SilentlyContinue
+                "REMOVED libreoffice\$sub  files=$c" | Out-File $log -Append
+              }
+            }
+            # ---- 8. python 的 tcl/tk 演示 ----
+            $tcl = Join-Path $d "resources\runtime\primary-runtime\dependencies\python\tcl"
+            if (Test-Path $tcl) {
+              $c = (Get-ChildItem $tcl -Recurse -File -ErrorAction SilentlyContinue).Count
+              Remove-Item $tcl -Recurse -Force -ErrorAction SilentlyContinue
+              "REMOVED python\tcl  files=$c" | Out-File $log -Append
             }
           }
+
           "" | Out-File $log -Append
-          "=== 删除后 ===" | Out-File $log -Append
           $after = Get-ChildItem $d -Recurse -File -ErrorAction SilentlyContinue
-          "files=$($after.Count)  size={0:N1} MB" -f (($after | Measure-Object Length -Sum).Sum/1MB) | Out-File $log -Append
+          "AFTER: files=$($after.Count)  size={0:N1} MB" -f (($after | Measure-Object Length -Sum).Sum/1MB) | Out-File $log -Append
           Get-Content $log
       - name: Remove bracket files
         run: |
@@ -81,9 +135,7 @@ jobs:
                 $nm = [System.IO.Path]::GetFileName($f)
                 if ($nm.Contains("[") -or $nm.Contains("]")) { [System.IO.File]::Delete($f); $removed++ }
               }
-              foreach ($sub in [System.IO.Directory]::GetDirectories($dir)) {
-                $stack.Push($sub)
-              }
+              foreach ($sub in [System.IO.Directory]::GetDirectories($dir)) { $stack.Push($sub) }
             } catch {}
           }
           Write-Host "bracket files removed = $removed"
@@ -120,7 +172,7 @@ jobs:
           I 44 44 (Join-Path $a "Square44x44Logo.png")
           I 150 150 (Join-Path $a "Square150x150Logo.png")
           I 310 150 (Join-Path $a "Wide310x150Logo.png")
-      - name: Pack slim
+      - name: Pack
         id: pack
         continue-on-error: true
         run: |
@@ -128,32 +180,17 @@ jobs:
           $mk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
           New-Item -ItemType Directory -Force -Path "C:\out" | Out-Null
           $sw = [System.Diagnostics.Stopwatch]::StartNew()
-          & $mk pack /d $d /p "C:\out\slim.appx" /o /nc 2>&1 | Tee-Object p1.log
+          & $mk pack /d $d /p "C:\out\app.appx" /o /nc 2>&1 | Tee-Object p1.log
           $sw.Stop()
-          Write-Host "EXIT=$LASTEXITCODE  elapsed=$($sw.Elapsed.TotalSeconds)s"
-          if (Test-Path "C:\out\slim.appx") {
-            $s = (Get-Item "C:\out\slim.appx").Length
-            Write-Host "*** SUCCESS $s bytes ({0:N1} MB) ***" -f ($s/1MB)
+          Write-Host "EXIT=$LASTEXITCODE  elapsed=$([math]::Round($sw.Elapsed.TotalSeconds))s"
+          if (Test-Path "C:\out\app.appx") {
+            $s = (Get-Item "C:\out\app.appx").Length
+            Write-Host "*** SUCCESS {0:N1} MB ***" -f ($s/1MB)
             New-Item -ItemType Directory -Force -Path dist-msix | Out-Null
-            Copy-Item "C:\out\slim.appx" "dist-msix\slim.appx" -Force
+            Copy-Item "C:\out\app.appx" "dist-msix\bluefish.appx" -Force
           } else {
             Write-Host "*** FAILED ***"
             Get-Content p1.log -ErrorAction SilentlyContinue | Select-Object -Last 5
-          }
-      - name: Pack slim with validation off
-        id: pack2
-        if: steps.pack.outcome != 'success'
-        continue-on-error: true
-        run: |
-          $d = "${{ steps.inst.outputs.appdir }}"
-          $mk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
-          & $mk pack /d $d /p "C:\out\slim2.appx" /o /nc /nv 2>&1 | Tee-Object p2.log
-          Write-Host "EXIT=$LASTEXITCODE"
-          if (Test-Path "C:\out\slim2.appx") {
-            $s = (Get-Item "C:\out\slim2.appx").Length
-            Write-Host "*** SUCCESS (nv) $s bytes ***"
-            New-Item -ItemType Directory -Force -Path dist-msix | Out-Null
-            Copy-Item "C:\out\slim2.appx" "dist-msix\slim2.appx" -Force
           }
       - name: Upload
         if: always()
