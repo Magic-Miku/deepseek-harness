@@ -6,7 +6,7 @@ permissions:
 jobs:
   build:
     runs-on: windows-2022
-    timeout-minutes: 90
+    timeout-minutes: 60
     defaults:
       run:
         shell: pwsh
@@ -26,113 +26,148 @@ jobs:
           $exe = Get-ChildItem $target -Recurse -Filter "DeepSeek Harness.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $exe) { throw "app exe not found" }
           $n = (Get-ChildItem $target -Recurse -File -ErrorAction SilentlyContinue).Count
-          Write-Host "appdir = $($exe.Directory.FullName)  files = $n  (完整，一个不删)"
+          Write-Host "appdir = $($exe.Directory.FullName)  files = $n"
           "appdir=$($exe.Directory.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
-      - name: Write manifest and icons
+
+      - name: Inspect the suspect file
         run: |
           $d = "${{ steps.inst.outputs.appdir }}"
-          $v = "1.0.$env:GITHUB_RUN_NUMBER.0"
-          Write-Host "version = $v"
-          $L = @(
-          '<?xml version="1.0" encoding="utf-8"?>'
-          '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap rescap">'
-          ('  <Identity Name="14714BE0.320850A8A419A" Publisher="CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" Version="' + $v + '" ProcessorArchitecture="x64" />')
-          '  <Properties><DisplayName>BlueFish</DisplayName><PublisherDisplayName>Miku</PublisherDisplayName><Logo>Assets\StoreLogo.png</Logo></Properties>'
-          '  <Dependencies><TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.19041.0" /></Dependencies>'
-          '  <Resources><Resource Language="en-us" /></Resources>'
-          '  <Capabilities><Capability Name="internetClient" /><rescap:Capability Name="runFullTrust" /></Capabilities>'
-          '  <Applications><Application Id="App" Executable="DeepSeek Harness.exe" EntryPoint="Windows.FullTrustApplication">'
-          '    <uap:VisualElements DisplayName="BlueFish" Description="BlueFish" BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png" />'
-          '  </Application></Applications>'
-          '</Package>'
-          )
-          [System.IO.File]::WriteAllText((Join-Path $d "AppxManifest.xml"), ($L -join "`r`n"), (New-Object System.Text.UTF8Encoding $false))
-          $a = Join-Path $d "Assets"
-          New-Item -ItemType Directory -Force -Path $a | Out-Null
-          Add-Type -AssemblyName System.Drawing
-          function I($w,$h,$o) {
-            $b = New-Object System.Drawing.Bitmap $w,$h
-            $g = [System.Drawing.Graphics]::FromImage($b)
-            $g.Clear([System.Drawing.Color]::FromArgb(58,95,170))
-            $b.Save($o, [System.Drawing.Imaging.ImageFormat]::Png)
-            $g.Dispose(); $b.Dispose()
+          $suspect = Join-Path $d "resources\runtime\primary-runtime\dependencies\python\Lib\site-packages\pandas\core\sorting.py"
+          $log = "s1-suspect.log"
+          "=== 1. 文件是否存在 ===" | Out-File $log
+          "exists = $(Test-Path $suspect)" | Out-File $log -Append
+          if (-not (Test-Path $suspect)) { Get-Content $log; exit }
+
+          "=== 2. 文件属性 ===" | Out-File $log -Append
+          $fi = Get-Item -LiteralPath $suspect
+          "Name       = $($fi.Name)" | Out-File $log -Append
+          "Length     = $($fi.Length)" | Out-File $log -Append
+          "Attributes = $($fi.Attributes)" | Out-File $log -Append
+          "CreationTimeUtc   = $($fi.CreationTimeUtc)" | Out-File $log -Append
+          "LastWriteTimeUtc  = $($fi.LastWriteTimeUtc)" | Out-File $log -Append
+          "LinkType   = $($fi.LinkType)" | Out-File $log -Append
+          "Target     = $($fi.Target)" | Out-File $log -Append
+
+          "=== 3. 是否重解析点/符号链接 ===" | Out-File $log -Append
+          $reparse = ($fi.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+          "ReparsePoint = $reparse" | Out-File $log -Append
+          "==> fsutil 检查 ==" | Out-File $log -Append
+          (fsutil reparsepoint query "$suspect" 2>&1 | Select-Object -First 10) | Out-File $log -Append
+
+          "=== 4. 尝试独占打开 ===" | Out-File $log -Append
+          try {
+            $fs = [System.IO.File]::Open($suspect, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+            $fs.Close()
+            "独占打开: 成功（没被占用）" | Out-File $log -Append
+          } catch {
+            "独占打开: 失败 - $($_.Exception.Message)" | Out-File $log -Append
           }
-          I 50 50 (Join-Path $a "StoreLogo.png")
-          I 44 44 (Join-Path $a "Square44x44Logo.png")
-          I 150 150 (Join-Path $a "Square150x150Logo.png")
-          I 310 150 (Join-Path $a "Wide310x150Logo.png")
-          Write-Host "manifest + icons done"
-      - name: List makeappx versions
-        id: list
-        run: |
-          $kits = "C:\Program Files (x86)\Windows Kits\10\bin"
-          $all = Get-ChildItem $kits -Filter makeappx.exe -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match "\\x64\\" } |
-            Sort-Object FullName
-          Write-Host "=== 可用的 x64 makeappx ==="
-          $all | ForEach-Object { Write-Host "  $($_.FullName)" }
-          $list = ($all | ForEach-Object { $_.FullName }) -join "`n"
-          "list<<EOF" | Out-File -Append $env:GITHUB_OUTPUT
-          $list | Out-File -Append $env:GITHUB_OUTPUT
-          "EOF" | Out-File -Append $env:GITHUB_OUTPUT
-      - name: Try each makeappx version
-        continue-on-error: true
+
+          "=== 5. 文件前 15 行内容 ===" | Out-File $log -Append
+          (Get-Content -LiteralPath $suspect -TotalCount 15 -ErrorAction SilentlyContinue) | Out-File $log -Append
+
+          "=== 6. 十六进制头 32 字节 ===" | Out-File $log -Append
+          try {
+            $bytes = [System.IO.File]::ReadAllBytes($suspect)
+            $head = $bytes[0..31] | ForEach-Object { $_.ToString('X2') }
+            ($head -join ' ') | Out-File $log -Append
+          } catch { "读取失败: $($_.Exception.Message)" | Out-File $log -Append }
+
+          Get-Content $log
+
+      - name: Check all files in the parent dir
         run: |
           $d = "${{ steps.inst.outputs.appdir }}"
-          $kits = "C:\Program Files (x86)\Windows Kits\10\bin"
-          $vers = Get-ChildItem $kits -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match '^10\.' } | Sort-Object Name
-          New-Item -ItemType Directory -Force -Path "C:\out" | Out-Null
-          New-Item -ItemType Directory -Force -Path dist-msix | Out-Null
-
-          foreach ($v in $vers) {
-            $mk = Join-Path $v.FullName "x64\makeappx.exe"
-            if (-not (Test-Path $mk)) { continue }
-            $tag = $v.Name
-            Write-Host ""
-            Write-Host "==================================================" 
-            Write-Host "尝试 makeappx $tag"
-            Write-Host "  $mk"
-            Write-Host "=================================================="
-
-            $outFile = "C:\out\app-$tag.appx"
-            $logFile = "p-$tag.log"
-            Remove-Item $outFile -Force -ErrorAction SilentlyContinue
-
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
-            & $mk pack /d $d /p $outFile /o /nc 2>&1 | Out-File $logFile
-            $code = $LASTEXITCODE
-            $sw.Stop()
-
-            Write-Host "  EXIT=$code  elapsed=$([math]::Round($sw.Elapsed.TotalSeconds))s"
-
-            if ((Test-Path $outFile) -and $code -eq 0) {
-              $mb = [math]::Round((Get-Item $outFile).Length/1MB, 1)
-              Write-Host "  *** 成功 $tag : $mb MB ***"
-              Copy-Item $outFile "dist-msix\bluefish-$tag.appx" -Force
-            } else {
-              Write-Host "  --- 失败 $tag ---"
-              Get-Content $logFile -ErrorAction SilentlyContinue |
-                Where-Object { $_ -match 'error|Error|failed' } |
-                Select-Object -Last 3 | ForEach-Object { Write-Host "      $_" }
+          $dir = Join-Path $d "resources\runtime\primary-runtime\dependencies\python\Lib\site-packages\pandas\core"
+          $log = "s2-dir.log"
+          "=== pandas\core 目录 ===" | Out-File $log
+          if (-not (Test-Path $dir)) { "目录不存在" | Out-File $log -Append; Get-Content $log; exit }
+          $files = Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue | Sort-Object Name
+          "文件数 = $($files.Count)" | Out-File $log -Append
+          "" | Out-File $log -Append
+          "--- 独占打开测试 ---" | Out-File $log -Append
+          $locked = 0
+          foreach ($f in $files) {
+            try {
+              $fs = [System.IO.File]::Open($f.FullName, 'Open', 'Read', 'None')
+              $fs.Close()
+            } catch {
+              "LOCKED: $($f.Name) - $($_.Exception.Message)" | Out-File $log -Append
+              $locked++
             }
           }
-          Write-Host ""
-          Write-Host "=== dist-msix 内容 ==="
-          Get-ChildItem dist-msix -ErrorAction SilentlyContinue | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}} | Format-Table -AutoSize
-      - name: Upload any success
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: dsh-msix
-          path: dist-msix/*
-          if-no-files-found: warn
-          retention-days: 30
+          "被占用文件数 = $locked" | Out-File $log -Append
+          "" | Out-File $log -Append
+          "--- 含非 ASCII 字符的文件名 ---" | Out-File $log -Append
+          $files | Where-Object { $_.Name -match '[^\x20-\x7E]' } | ForEach-Object { "  $($_.Name)" } | Out-File $log -Append
+          "" | Out-File $log -Append
+          "--- 名字以点/空格结尾 ---" | Out-File $log -Append
+          $files | Where-Object { $_.Name -ne $_.Name.TrimEnd('.',' ') } | ForEach-Object { "  [$($_.Name)]" } | Out-File $log -Append
+          Get-Content $log
+
+      - name: Full scan for problems
+        run: |
+          $d = "${{ steps.inst.outputs.appdir }}"
+          $log = "s3-scan.log"
+          "=== 全盘扫描（用 .NET 绕过 PowerShell 通配符）===" | Out-File $log
+          $problems = @{
+            locked = @()
+            nonAscii = @()
+            trailing = @()
+            reparse = @()
+            longpath = @()
+          }
+          $stack = New-Object System.Collections.Stack
+          $stack.Push($d)
+          $count = 0
+          while ($stack.Count -gt 0) {
+            $cur = $stack.Pop()
+            try {
+              foreach ($f in [System.IO.Directory]::GetFiles($cur)) {
+                $count++
+                $nm = [System.IO.Path]::GetFileName($f)
+                $rel = $f.Substring($d.Length)
+                if ($nm -match '[^\x20-\x7E]') { $problems.nonAscii += $rel }
+                if ($nm -ne $nm.TrimEnd('.',' ')) { $problems.trailing += $rel }
+                if ($rel.Length -gt 200) { $problems.longpath += "$($rel.Length) : $rel" }
+                try {
+                  $fs = [System.IO.File]::Open($f, 'Open', 'Read', 'None')
+                  $fs.Close()
+                } catch { $problems.locked += "$rel : $($_.Exception.Message)" }
+              }
+              foreach ($sub in [System.IO.Directory]::GetDirectories($cur)) {
+                $attrs = [System.IO.File]::GetAttributes($sub)
+                if (($attrs -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                  $problems.reparse += $sub.Substring($d.Length)
+                } else {
+                  $stack.Push($sub)
+                }
+              }
+            } catch { "ERR: $cur - $($_.Exception.Message)" | Out-File $log -Append }
+          }
+          "扫描文件数 = $count" | Out-File $log -Append
+          "" | Out-File $log -Append
+          "被占用 = $($problems.locked.Count)" | Out-File $log -Append
+          $problems.locked | Select-Object -First 20 | Out-File $log -Append
+          "" | Out-File $log -Append
+          "非ASCII名 = $($problems.nonAscii.Count)" | Out-File $log -Append
+          $problems.nonAscii | Select-Object -First 20 | Out-File $log -Append
+          "" | Out-File $log -Append
+          "末尾点/空格 = $($problems.trailing.Count)" | Out-File $log -Append
+          $problems.trailing | Select-Object -First 20 | Out-File $log -Append
+          "" | Out-File $log -Append
+          "符号链接 = $($problems.reparse.Count)" | Out-File $log -Append
+          $problems.reparse | Select-Object -First 20 | Out-File $log -Append
+          "" | Out-File $log -Append
+          "超长路径(>200) = $($problems.longpath.Count)" | Out-File $log -Append
+          $problems.longpath | Sort-Object -Descending | Select-Object -First 20 | Out-File $log -Append
+          Get-Content $log | Select-Object -First 80
+
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: winapp-logs
-          path: p-*.log
+          path: s*.log
           if-no-files-found: warn
           retention-days: 14
