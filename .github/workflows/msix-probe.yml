@@ -45,53 +45,39 @@ jobs:
           '@
           ($c -split "`n" | ForEach-Object { $_.TrimStart() }) -join "`n" |
             Out-File "apps/desktop/.env.windows" -Encoding utf8 -NoNewline
-          Write-Host "=== .env.windows ==="
           Get-Content "apps/desktop/.env.windows"
-
-      - name: Verify pnpm
-        shell: pwsh
-        run: |
-          Write-Host "node: $(node --version)"
-          Write-Host "pnpm: $(pnpm --version)"
-
-      - name: Probe toolchain
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          $log = "probe-2-toolchain.log"
-          "node : $(node --version)" | Out-File $log
-          "pnpm : $(pnpm --version)" | Out-File $log -Append
-          "" | Out-File $log -Append
-          "=== tar ===" | Out-File $log -Append
-          $tmp = Join-Path $env:RUNNER_TEMP "tarprobe"
-          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
-          Set-Content -Path (Join-Path $tmp "probe.txt") -Value "probe"
-          Push-Location $tmp
-          (tar -czf probe.tar.gz probe.txt 2>&1) | Out-File $log -Append
-          (tar -tzf probe.tar.gz 2>&1) | Out-File $log -Append
-          Pop-Location
-          "" | Out-File $log -Append
-          "=== MSVC ===" | Out-File $log -Append
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $p = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          "VC tools : $p" | Out-File $log -Append
 
       - name: Install dependencies
         id: install
         shell: pwsh
         continue-on-error: true
         run: |
-          $log = "probe-3-install.log"
+          $log = "probe-1-install.log"
           pnpm install --frozen-lockfile *>&1 | Tee-Object -FilePath $log
           "EXIT=$LASTEXITCODE" | Tee-Object -Append -FilePath $log
 
-      - name: Probe check mode
-        id: check
+      # 关键：用 --unsigned --check，走跳过签名的校验路径
+      - name: Check (unsigned, skip signing)
+        id: check_unsigned
         shell: pwsh
         continue-on-error: true
         run: |
-          $log = "probe-4-check.log"
-          pnpm --filter @deepseek-ai/dsh-desktop run check:package *>&1 | Tee-Object -FilePath $log
+          $log = "probe-2-check-unsigned.log"
+          Push-Location apps/desktop
+          pnpm exec tsx scripts/package-target.ts win-x64 --unsigned --check *>&1 |
+            Tee-Object -FilePath "..\..\$log"
+          "EXIT=$LASTEXITCODE" | Tee-Object -Append -FilePath "..\..\$log"
+          Pop-Location
+
+      # 对照：普通 check（预期因缺证书失败，用于确认差异）
+      - name: Check (signed, for comparison)
+        id: check_signed
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $log = "probe-3-check-signed.log"
+          pnpm --filter @deepseek-ai/dsh-desktop run check:package *>&1 |
+            Tee-Object -FilePath $log
           "EXIT=$LASTEXITCODE" | Tee-Object -Append -FilePath $log
 
       - name: Commit logs
@@ -103,7 +89,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout --orphan probe-logs 2>/dev/null || git checkout probe-logs
           git add -f probe-*.log
-          git commit -m "probe run ${{ github.run_id }} install=${{ steps.install.outcome }} check=${{ steps.check.outcome }}" || echo "nothing"
+          git commit -m "probe run ${{ github.run_id }} unsigned=${{ steps.check_unsigned.outcome }} signed=${{ steps.check_signed.outcome }}" || echo "nothing"
           git push -f origin probe-logs
 
       - name: Upload logs
