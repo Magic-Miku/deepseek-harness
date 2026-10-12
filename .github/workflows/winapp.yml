@@ -15,10 +15,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Setup WinApp CLI
-        uses: microsoft/setup-WinAppCli@v1
+        uses: microsoft/setup-WinAppCli@v0.2
         continue-on-error: true
       - name: Verify winapp
         run: |
+          Write-Host "=== which winapp ==="
+          Get-Command winapp -ErrorAction SilentlyContinue | Select-Object Source
           Write-Host "=== winapp --help ==="
           winapp --help 2>&1 | Select-Object -First 30
           Write-Host "EXIT=$LASTEXITCODE"
@@ -79,12 +81,7 @@ jobs:
       - name: Manifest generate
         continue-on-error: true
         run: |
-          winapp manifest generate "D:\L2" `
-            --package-name "14714BE0.320850A8A419A" `
-            --publisher-name "CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" `
-            --version "1.0.$env:GITHUB_RUN_NUMBER.0" `
-            --entrypoint "DeepSeek Harness.exe" `
-            --if-exists Overwrite 2>&1 | Tee-Object m1.log
+          winapp manifest generate "D:\L2" --package-name "14714BE0.320850A8A419A" --publisher-name "CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" --version "1.0.$env:GITHUB_RUN_NUMBER.0" --entrypoint "DeepSeek Harness.exe" --if-exists Overwrite 2>&1 | Tee-Object m1.log
           Write-Host "EXIT=$LASTEXITCODE"
       - name: Show manifest
         if: always()
@@ -99,6 +96,7 @@ jobs:
         id: pack
         continue-on-error: true
         run: |
+          New-Item -ItemType Directory -Force -Path "D:\out" | Out-Null
           winapp pack "D:\L2" --no-sign --output "D:\out\app.msix" 2>&1 | Tee-Object p1.log
           Write-Host "EXIT=$LASTEXITCODE"
           if (Test-Path "D:\out\app.msix") {
@@ -110,7 +108,7 @@ jobs:
             Write-Host "*** MSIX MISSING ***"
             Get-ChildItem "D:\out" -ErrorAction SilentlyContinue
           }
-      - name: Fallback makeappx with APPXSIP_LOG
+      - name: Fallback makeappx
         if: steps.pack.outcome != 'success'
         continue-on-error: true
         run: |
