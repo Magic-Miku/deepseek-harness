@@ -26,28 +26,22 @@ jobs:
           version: 11.28.5
           run_install: false
 
-      # ★ 关键：现场生成 .env.windows（不依赖仓库里的文件）
       - name: Create .env.windows
         shell: pwsh
         run: |
-          $content = @'
+          $c = @'
           DSH_DESKTOP_APP_ID=com.deepseek.harness
           DSH_DESKTOP_AUTO_UPDATE_ENV=test
-          DOWNLOAD_TEST_ORIGIN=https://example.invalid/dsh-downloads
+          DOWNLOAD_TEST_ORIGIN=https://example.invalid
           DOWNLOAD_TEST_RELEASE_ID=00000000000000000000000000000000
-          DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN=https://example.invalid/dsh-update-test
-          DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=https://example.invalid/dsh-update-prod
+          DSH_DESKTOP_MANDATORY_UPDATE_TEST_ORIGIN=https://example.invalid
+          DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=https://example.invalid
           DSH_DESKTOP_MANDATORY_UPDATE_CONFIG={"allowedAuthOrigins":["https://example.invalid"]}
-          DSH_DESKTOP_WINDOWS_CER_FILE=
-          DSH_DESKTOP_WINDOWS_SIGNTOOL=
-          DSH_DESKTOP_WINDOWS_KEY_CONTAINER=
-          DSH_DESKTOP_WINDOWS_TOKEN_PIN=
           DSH_DESKTOP_WINDOWS_SIGNATURE_CACHE_CONCURRENCY=4
           '@
-          # 去掉每行前导空格
-          $lines = $content -split "`n" | ForEach-Object { $_.TrimStart() }
-          $lines -join "`n" | Out-File "apps/desktop/.env.windows" -Encoding utf8 -NoNewline
-          Write-Host "=== 已生成 .env.windows ==="
+          ($c -split "`n" | ForEach-Object { $_.TrimStart() }) -join "`n" |
+            Out-File "apps/desktop/.env.windows" -Encoding utf8 -NoNewline
+          Write-Host "=== .env.windows ==="
           Get-Content "apps/desktop/.env.windows"
 
       - name: Verify pnpm
