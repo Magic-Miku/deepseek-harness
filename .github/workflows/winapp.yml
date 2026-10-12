@@ -10,127 +10,132 @@ jobs:
     defaults:
       run:
         shell: pwsh
-    env:
-      APPXSIP_LOG: '1'
     steps:
       - uses: actions/checkout@v4
-      - name: Setup WinApp CLI
-        uses: microsoft/setup-WinAppCli@v0.2
-        continue-on-error: true
-      - name: Verify winapp
+      - name: Silent install to disk
+        id: inst
         run: |
-          Get-Command winapp -ErrorAction SilentlyContinue | Select-Object Source
-          winapp --help 2>&1 | Select-Object -First 15
-          Write-Host "EXIT=$LASTEXITCODE"
-      - name: Download exe
-        run: |
-          curl.exe -L --retry 3 --max-time 1800 -o dsh.exe "https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe"
-          $s = (Get-Item dsh.exe).Length
-          Write-Host "size = $s"
+          $tmp = "$env:RUNNER_TEMP\dsh.exe"
+          curl.exe -L --retry 3 --max-time 1800 -o $tmp "https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe"
+          $s = (Get-Item $tmp).Length
+          Write-Host "downloaded = $s"
           if ($s -lt 200MB) { throw "download too small" }
-      - name: Extract layer 1
+          $target = "C:\DSHApp"
+          New-Item -ItemType Directory -Force -Path $target | Out-Null
+          Write-Host "installing to $target ..."
+          $p = Start-Process -FilePath $tmp -ArgumentList "/S", "/D=$target" -Wait -PassThru
+          Write-Host "installer exit = $($p.ExitCode)"
+          Start-Sleep -Seconds 6
+          $n = (Get-ChildItem $target -Recurse -File -ErrorAction SilentlyContinue).Count
+          Write-Host "installed files = $n"
+          if ($n -lt 100) {
+            Write-Host "=== target contents ==="
+            Get-ChildItem $target -Recurse -ErrorAction SilentlyContinue | Select-Object -First 30 FullName
+            throw "silent install produced too few files"
+          }
+          $exe = Get-ChildItem $target -Recurse -Filter "DeepSeek Harness.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) { throw "app exe not found after install" }
+          Write-Host "app exe = $($exe.FullName)"
+          "appdir=$($exe.Directory.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
+      - name: Show structure
+        if: always()
         run: |
-          $z = "C:\Program Files\7-Zip\7z.exe"
-          New-Item -ItemType Directory -Force -Path "D:\L1" | Out-Null
-          & $z x dsh.exe -o"D:\L1" -y 2>&1 | Tee-Object a1.log
-          Write-Host "EXIT=$LASTEXITCODE"
-      - name: Extract layer 2
-        run: |
-          $inner = "D:\L1\`$PLUGINSDIR\app-64.7z"
-          Write-Host "exists = $(Test-Path $inner)"
-          if (-not (Test-Path $inner)) { throw "inner not found" }
-          $z = "C:\Program Files\7-Zip\7z.exe"
-          New-Item -ItemType Directory -Force -Path "D:\L2" | Out-Null
-          & $z x $inner -o"D:\L2" -y 2>&1 | Tee-Object a3.log
-          Write-Host "EXIT=$LASTEXITCODE"
-          $n = (Get-ChildItem "D:\L2" -Recurse -File -ErrorAction SilentlyContinue).Count
-          Write-Host "files = $n"
+          $d = "${{ steps.inst.outputs.appdir }}"
+          if (-not $d) { Write-Host "no appdir"; exit }
+          Write-Host "=== appdir = $d ==="
+          Get-ChildItem $d | Select-Object Mode, Name | Format-Table -AutoSize
+          Write-Host "=== resources ==="
+          Get-ChildItem (Join-Path $d "resources") -ErrorAction SilentlyContinue | Select-Object Mode, Name | Format-Table -AutoSize
       - name: Remove bracket files
         if: always()
         run: |
+          $d = "${{ steps.inst.outputs.appdir }}"
+          if (-not $d) { exit }
           $log = "a5.log"
-          $root = "D:\L2"
           $removed = 0
           $stack = New-Object System.Collections.Stack
-          $stack.Push($root)
+          $stack.Push($d)
           while ($stack.Count -gt 0) {
             $dir = $stack.Pop()
             try {
               foreach ($f in [System.IO.Directory]::GetFiles($dir)) {
                 $nm = [System.IO.Path]::GetFileName($f)
                 if ($nm.Contains("[") -or $nm.Contains("]")) {
-                  "REMOVE FILE: $f" | Out-File $log -Append
+                  "REMOVE: $f" | Out-File $log -Append
                   [System.IO.File]::Delete($f)
                   $removed++
                 }
               }
-              foreach ($d in [System.IO.Directory]::GetDirectories($dir)) {
-                $nm = [System.IO.Path]::GetFileName($d)
+              foreach ($sub in [System.IO.Directory]::GetDirectories($dir)) {
+                $nm = [System.IO.Path]::GetFileName($sub)
                 if ($nm.Contains("[") -or $nm.Contains("]")) {
-                  "REMOVE DIR: $d" | Out-File $log -Append
-                  [System.IO.Directory]::Delete($d, $true)
+                  [System.IO.Directory]::Delete($sub, $true)
                   $removed++
-                } else { $stack.Push($d) }
+                } else { $stack.Push($sub) }
               }
-            } catch { "ERR: $dir $($_.Exception.Message)" | Out-File $log -Append }
+            } catch {}
           }
           "removed = $removed" | Out-File $log -Append
           Get-Content $log
-      - name: Set manifest dir
-        id: setdir
-        run: |
-          $exe = Get-ChildItem "D:\L2" -Recurse -Filter "DeepSeek Harness.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $exe) { throw "app exe not found" }
-          Write-Host "exe = $($exe.FullName)"
-          Write-Host "dir = $($exe.Directory.FullName)"
-          "appdir=$($exe.Directory.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
-          "exepath=$($exe.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
-      - name: Manifest generate
-        continue-on-error: true
-        run: |
-          $d = "${{ steps.setdir.outputs.appdir }}"
-          $e = "${{ steps.setdir.outputs.exepath }}"
-          $v = "1.0.$env:GITHUB_RUN_NUMBER.0"
-          Write-Host "dir=$d"
-          Write-Host "exe=$e"
-          Write-Host "ver=$v"
-          Push-Location $d
-          winapp manifest generate . --package-name "14714BE0.320850A8A419A" --publisher-name "CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" --version $v --entrypoint $e --logo-path "Assets\StoreLogo.png" --if-exists Overwrite 2>&1 | Tee-Object "D:\m1.log"
-          Write-Host "EXIT=$LASTEXITCODE"
-          Pop-Location
-          Write-Host "=== files in appdir ==="
-          Get-ChildItem $d -Filter "*.appxmanifest" -ErrorAction SilentlyContinue | Select-Object Name
-          Get-ChildItem $d -Filter "*.xml" -ErrorAction SilentlyContinue | Select-Object Name
-      - name: Show manifest
+      - name: Write manifest
         if: always()
         run: |
-          $d = "${{ steps.setdir.outputs.appdir }}"
-          $mf = Join-Path $d "Package.appxmanifest"
-          if (Test-Path $mf) {
-            Write-Host "=== Package.appxmanifest ==="
-            Get-Content $mf
-          } else {
-            Write-Host "NO Package.appxmanifest at $mf"
-            Get-Content "D:\m1.log" -ErrorAction SilentlyContinue
+          $d = "${{ steps.inst.outputs.appdir }}"
+          if (-not $d) { exit }
+          $v = "1.0.$env:GITHUB_RUN_NUMBER.0"
+          Write-Host "version = $v"
+          $L = @(
+          '<?xml version="1.0" encoding="utf-8"?>'
+          '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap rescap">'
+          ('  <Identity Name="14714BE0.320850A8A419A" Publisher="CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" Version="' + $v + '" ProcessorArchitecture="x64" />')
+          '  <Properties><DisplayName>BlueFish</DisplayName><PublisherDisplayName>Miku</PublisherDisplayName><Logo>Assets\StoreLogo.png</Logo></Properties>'
+          '  <Dependencies><TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.19041.0" /></Dependencies>'
+          '  <Resources><Resource Language="en-us" /></Resources>'
+          '  <Capabilities><Capability Name="internetClient" /><rescap:Capability Name="runFullTrust" /></Capabilities>'
+          '  <Applications><Application Id="App" Executable="DeepSeek Harness.exe" EntryPoint="Windows.FullTrustApplication">'
+          '    <uap:VisualElements DisplayName="BlueFish" Description="BlueFish" BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png" />'
+          '  </Application></Applications>'
+          '</Package>'
+          )
+          [System.IO.File]::WriteAllText((Join-Path $d "AppxManifest.xml"), ($L -join "`r`n"), (New-Object System.Text.UTF8Encoding $false))
+          $a = Join-Path $d "Assets"
+          New-Item -ItemType Directory -Force -Path $a | Out-Null
+          Add-Type -AssemblyName System.Drawing
+          function I($w,$h,$o) {
+            $b = New-Object System.Drawing.Bitmap $w,$h
+            $g = [System.Drawing.Graphics]::FromImage($b)
+            $g.Clear([System.Drawing.Color]::FromArgb(58,95,170))
+            $b.Save($o, [System.Drawing.Imaging.ImageFormat]::Png)
+            $g.Dispose(); $b.Dispose()
           }
-      - name: Pack MSIX
+          I 50 50 (Join-Path $a "StoreLogo.png")
+          I 44 44 (Join-Path $a "Square44x44Logo.png")
+          I 150 150 (Join-Path $a "Square150x150Logo.png")
+          I 310 150 (Join-Path $a "Wide310x150Logo.png")
+          Write-Host "manifest + icons done"
+      - name: Pack
         id: pack
+        if: always()
         continue-on-error: true
         run: |
-          $d = "${{ steps.setdir.outputs.appdir }}"
-          New-Item -ItemType Directory -Force -Path "D:\out" | Out-Null
-          winapp pack $d --no-sign --output "D:\out\app.msix" 2>&1 | Tee-Object p1.log
+          $d = "${{ steps.inst.outputs.appdir }}"
+          if (-not $d) { Write-Host "no appdir"; exit }
+          $mk = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Filter makeappx.exe -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "\\x64\\" } | Sort-Object FullName -Descending | Select-Object -First 1
+          Write-Host "makeappx = $($mk.FullName)"
+          New-Item -ItemType Directory -Force -Path "C:\out" | Out-Null
+          & $mk.FullName pack /d $d /p "C:\out\app.appx" /o /nc 2>&1 | Tee-Object p1.log
           Write-Host "EXIT=$LASTEXITCODE"
-          if (Test-Path "D:\out\app.msix") {
-            $s = (Get-Item "D:\out\app.msix").Length
-            Write-Host "*** MSIX OK $s bytes ***"
+          if (Test-Path "C:\out\app.appx") {
+            $s = (Get-Item "C:\out\app.appx").Length
+            Write-Host "*** SUCCESS $s bytes ***"
             New-Item -ItemType Directory -Force -Path dist-msix | Out-Null
-            Copy-Item "D:\out\app.msix" "dist-msix\bluefish.msix" -Force
+            Copy-Item "C:\out\app.appx" "dist-msix\bluefish.appx" -Force
           } else {
-            Write-Host "*** MSIX MISSING ***"
-            Get-ChildItem "D:\out" -ErrorAction SilentlyContinue
+            Write-Host "*** FAILED ***"
+            Get-Content p1.log -ErrorAction SilentlyContinue | Select-Object -Last 6
           }
-      - name: Upload msix
+      - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
