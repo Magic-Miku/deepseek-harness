@@ -110,6 +110,38 @@ jobs:
           New-Icon 150 150 (Join-Path $assets "Square150x150Logo.png")
           New-Icon 310 150 (Join-Path $assets "Wide310x150Logo.png")
 
+      # ★ 新增：清理 MSIX 无法接受的文件（符号链接、.bin、非法文件名）
+      - name: Sanitize package dir for MSIX
+        if: steps.locate.outcome == 'success'
+        shell: pwsh
+        run: |
+          $dir = "${{ steps.locate.outputs.apdir }}"
+          $log = "b3-sanitize.log"
+          "DIR = $dir" | Out-File $log
+
+          $bins = Get-ChildItem -Path $dir -Directory -Recurse -Force -Filter ".bin" -ErrorAction SilentlyContinue
+          "bin dirs: $($bins.Count)" | Out-File $log -Append
+          $bins | ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+
+          $links = Get-ChildItem -Path $dir -Recurse -Force -ErrorAction SilentlyContinue |
+            Where-Object { ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 }
+          "reparse points: $($links.Count)" | Out-File $log -Append
+          $links | ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+
+          $badPattern = '[<>:"|?*\x00-\x1F]'
+          $all = Get-ChildItem -Path $dir -Recurse -Force -ErrorAction SilentlyContinue
+          $removed = 0
+          foreach ($item in $all) {
+            $rel = $item.FullName.Substring($dir.Length).TrimStart('\')
+            if ($rel -match $badPattern -or $item.Name -ne $item.Name.TrimEnd('.', ' ')) {
+              "REMOVE: $rel" | Out-File $log -Append
+              Remove-Item $item.FullName -Recurse -Force -ErrorAction SilentlyContinue
+              $removed++
+            }
+          }
+          "removed count: $removed" | Out-File $log -Append
+          Get-Content $log | Select-Object -First 40
+
       - name: Resolve appx version
         id: ver
         shell: pwsh
@@ -170,6 +202,7 @@ jobs:
             Where-Object { $_.FullName -match "x64" } |
             Sort-Object FullName -Descending | Select-Object -First 1
           if (-not $makeappx) { throw "makeappx.exe not found" }
+          Write-Host "makeappx: $($makeappx.FullName)"
           New-Item -ItemType Directory -Force -Path "dist-msix" | Out-Null
           $out = "dist-msix\blue-fish.appx"
           & $makeappx.FullName pack /d $dir /p $out /o *>&1 | Tee-Object -FilePath b4-makeappx.log
