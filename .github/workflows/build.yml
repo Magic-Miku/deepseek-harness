@@ -1,10 +1,211 @@
-name: Build Test
+name: Package MSIX
 
 on:
   workflow_dispatch:
+    inputs:
+      appx_version:
+        description: 'MSIX version (auto = 1.0.run.0)'
+        type: string
+        default: 'auto'
+        required: true
+
+permissions:
+  contents: write
 
 jobs:
-  test:
+  build:
     runs-on: windows-2022
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+
     steps:
-      - run: echo hello
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.28.5
+          run_install: false
+
+      - name: Remove stale .env.windows
+        continue-on-error: true
+        run: |
+          if (Test-Path "apps/desktop/.env.windows") {
+            Remove-Item "apps/desktop/.env.windows" -Force
+          }
+
+      - name: Install dependencies
+        id: install
+        continue-on-error: true
+        run: |
+          pnpm install --frozen-lockfile *>&1 | Tee-Object -FilePath b1-install.log
+          "EXIT=$LASTEXITCODE" | Tee-Object -Append -FilePath b1-install.log
+          exit $LASTEXITCODE
+
+      - name: Prepare package settings
+        id: settings
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        env:
+          PACKAGE_BUILD_VERSION: auto
+          PACKAGE_DEPLOYMENT: test
+          PACKAGE_POLICY_ORIGIN: https://example.invalid
+          PACKAGE_LOGIN_ORIGINS: https://example.invalid
+        run: |
+          pnpm exec tsx apps/desktop/scripts/prepare-windows-ci.mjs *>&1 | Tee-Object -FilePath b0-prepare.log
+          "EXIT=$LASTEXITCODE" | Tee-Object -Append -FilePath b0-prepare.log
+
+      - name: Package dir (official script, unsigned)
+        id: dir
+        if: steps.settings.outcome == 'success'
+        continue-on-error: true
+        env:
+          PACKAGE_VERSION: ${{ steps.settings.outputs.version }}
+        run: |
+          Push-Location apps/desktop
+          pnpm exec tsx scripts/package-target.ts win-x64 --unsigned --dir --build-version "$env:PACKAGE_VERSION" *>&1 |
+            Tee-Object -FilePath "..\..\b2-dir.log"
+          "EXIT=$LASTEXITCODE" | Tee-Object -Append -FilePath "..\..\b2-dir.log"
+          Pop-Location
+
+      - name: Locate packaged dir
+        id: locate
+        if: steps.dir.outcome == 'success'
+        shell: pwsh
+        run: |
+          $root = "apps/desktop/.desktop-build"
+          $cands = Get-ChildItem -Path $root -Directory -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { Test-Path (Join-Path $_.FullName "DeepSeek Harness.exe") }
+          $dir = $cands | Select-Object -First 1
+          if (-not $dir) { throw "app dir not found" }
+          "apdir=$($dir.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
+          Write-Host "APP DIR = $($dir.FullName)"
+
+      - name: Generate Assets icons
+        if: steps.locate.outcome == 'success'
+        shell: pwsh
+        run: |
+          $dir = "${{ steps.locate.outputs.apdir }}"
+          $assets = Join-Path $dir "Assets"
+          New-Item -ItemType Directory -Force -Path $assets | Out-Null
+          Add-Type -AssemblyName System.Drawing
+          function New-Icon($w, $h, $out) {
+            $b = New-Object System.Drawing.Bitmap $w, $h
+            $g = [System.Drawing.Graphics]::FromImage($b)
+            $g.Clear([System.Drawing.Color]::FromArgb(58, 95, 170))
+            $b.Save($out, [System.Drawing.Imaging.ImageFormat]::Png)
+            $g.Dispose(); $b.Dispose()
+          }
+          New-Icon 50 50 (Join-Path $assets "StoreLogo.png")
+          New-Icon 44 44 (Join-Path $assets "Square44x44Logo.png")
+          New-Icon 150 150 (Join-Path $assets "Square150x150Logo.png")
+          New-Icon 310 150 (Join-Path $assets "Wide310x150Logo.png")
+
+      - name: Resolve appx version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = "${{ inputs.appx_version }}"
+          if ($v -eq 'auto' -or $v -eq '') { $v = "1.0.$env:GITHUB_RUN_NUMBER.0" }
+          "version=$v" | Out-File -Append $env:GITHUB_OUTPUT
+          Write-Host "APPX VERSION = $v"
+
+      - name: Write AppxManifest.xml
+        if: steps.locate.outcome == 'success'
+        shell: pwsh
+        run: |
+          $dir = "${{ steps.locate.outputs.apdir }}"
+          $ver = "${{ steps.ver.outputs.version }}"
+          $L = @(
+          '<?xml version="1.0" encoding="utf-8"?>'
+          '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap rescap">'
+          ('  <Identity Name="14714BE0.320850A8A419A" Publisher="CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" Version="' + $ver + '" />')
+          '  <Properties>'
+          '    <DisplayName>BlueFish</DisplayName>'
+          '    <PublisherDisplayName>Miku</PublisherDisplayName>'
+          '    <Logo>Assets\StoreLogo.png</Logo>'
+          '  </Properties>'
+          '  <Dependencies>'
+          '    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22621.0" />'
+          '  </Dependencies>'
+          '  <Resources>'
+          '    <Resource Language="zh-cn" />'
+          '    <Resource Language="en-us" />'
+          '  </Resources>'
+          '  <Applications>'
+          '    <Application Id="App" Executable="DeepSeek Harness.exe" EntryPoint="Windows.FullTrustApplication">'
+          '      <uap:VisualElements DisplayName="BlueFish" Description="BlueFish" BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png">'
+          '        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" />'
+          '      </uap:VisualElements>'
+          '    </Application>'
+          '  </Applications>'
+          '  <Capabilities>'
+          '    <rescap:Capability Name="runFullTrust" />'
+          '    <Capability Name="internetClient" />'
+          '  </Capabilities>'
+          '</Package>'
+          )
+          $xml = $L -join "`r`n"
+          [System.IO.File]::WriteAllText((Join-Path $dir "AppxManifest.xml"), $xml, (New-Object System.Text.UTF8Encoding $false))
+          Get-Content (Join-Path $dir "AppxManifest.xml") | Select-Object -First 8
+
+      - name: Pack appx with makeappx
+        id: pack
+        if: steps.locate.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $dir = "${{ steps.locate.outputs.apdir }}"
+          $kits = "C:\Program Files (x86)\Windows Kits\10\bin"
+          $makeappx = Get-ChildItem -Path $kits -Filter "makeappx.exe" -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "x64" } |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $makeappx) { throw "makeappx.exe not found" }
+          New-Item -ItemType Directory -Force -Path "dist-msix" | Out-Null
+          $out = "dist-msix\blue-fish.appx"
+          & $makeappx.FullName pack /d $dir /p $out /o *>&1 | Tee-Object -FilePath b4-makeappx.log
+          "EXIT=$LASTEXITCODE" | Tee-Object -Append -FilePath b4-makeappx.log
+          if (Test-Path $out) {
+            $sz = [math]::Round((Get-Item $out).Length/1MB,2)
+            Write-Host "APPX OK: $out ($sz MB)"
+          }
+
+      - name: Report artifacts
+        if: always()
+        shell: pwsh
+        run: |
+          $log = "b5-artifacts.log"
+          "=== dist-msix ===" | Out-File $log
+          if (Test-Path "dist-msix") {
+            (Get-ChildItem "dist-msix" -Recurse -File -ErrorAction SilentlyContinue |
+              Select-Object FullName, @{n='MB';e={[math]::Round($_.Length/1MB,2)}} |
+              Format-Table -AutoSize | Out-String) | Out-File $log -Append
+          }
+          Get-Content $log
+
+      - name: Upload appx
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-msix
+          path: dist-msix/*.appx
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: msix-build-logs
+          path: b*.log
+          if-no-files-found: warn
+          retention-days: 14
