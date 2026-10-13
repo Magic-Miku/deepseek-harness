@@ -30,10 +30,42 @@ jobs:
           $n = (Get-ChildItem $target -Recurse -File -ErrorAction SilentlyContinue).Count
           Write-Host "appdir = $($exe.Directory.FullName)  files = $n"
           "appdir=$($exe.Directory.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
-      - name: Write manifest and icons
+      - name: Stage with robocopy
+        id: stage
+        run: |
+          $src = "${{ steps.inst.outputs.appdir }}"
+          $dst = "C:\Staged"
+          if (Test-Path $dst) { Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue }
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+
+          $log = "s-stage.log"
+          "=== robocopy 复制（排除缓存/测试/文档）===" | Out-File $log
+          "" | Out-File $log -Append
+
+          $args = @(
+            $src, $dst, "/E", "/NFL", "/NDL", "/NP", "/R:1", "/W:1",
+            "/XD", "__pycache__", "tests", "test", "docs", "doc", "examples", "example", "demos",
+            "/XF", "*.pyc", "*.pyo", "*.pyi", "*.pdb", "*.patch", "*.diff"
+          )
+          & robocopy @args 2>&1 | Out-File $log -Append
+          "robocopy exit = $LASTEXITCODE" | Out-File $log -Append
+          "" | Out-File $log -Append
+
+          $origN = (Get-ChildItem $src -Recurse -File -Force -ErrorAction SilentlyContinue).Count
+          $newN  = (Get-ChildItem $dst -Recurse -File -Force -ErrorAction SilentlyContinue).Count
+          $newMB = [math]::Round((Get-ChildItem $dst -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum/1MB, 1)
+          "原始文件数: $origN" | Out-File $log -Append
+          "精简后文件数: $newN" | Out-File $log -Append
+          "精简后大小: $newMB MB" | Out-File $log -Append
+          Get-Content $log
+          "staged=$dst" | Out-File -Append $env:GITHUB_OUTPUT
+      - name: Copy manifest and icons to staged
         run: |
           $d = "${{ steps.inst.outputs.appdir }}"
+          $st = "${{ steps.stage.outputs.staged }}"
+          Copy-Item (Join-Path $d "AppxManifest.xml") $st -Force -ErrorAction SilentlyContinue
           $v = "1.0.$env:GITHUB_RUN_NUMBER.0"
+          # 重新生成 manifest（带正确版本号）
           $L = @(
           '<?xml version="1.0" encoding="utf-8"?>'
           '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap rescap">'
@@ -47,8 +79,8 @@ jobs:
           '  </Application></Applications>'
           '</Package>'
           )
-          [System.IO.File]::WriteAllText((Join-Path $d "AppxManifest.xml"), ($L -join "`r`n"), (New-Object System.Text.UTF8Encoding $false))
-          $a = Join-Path $d "Assets"
+          [System.IO.File]::WriteAllText((Join-Path $st "AppxManifest.xml"), ($L -join "`r`n"), (New-Object System.Text.UTF8Encoding $false))
+          $a = Join-Path $st "Assets"
           New-Item -ItemType Directory -Force -Path $a | Out-Null
           Add-Type -AssemblyName System.Drawing
           function I($w,$h,$o) {
@@ -62,49 +94,7 @@ jobs:
           I 44 44 (Join-Path $a "Square44x44Logo.png")
           I 150 150 (Join-Path $a "Square150x150Logo.png")
           I 310 150 (Join-Path $a "Wide310x150Logo.png")
-          Write-Host "manifest + icons done"
-      - name: Stage with aggressive exclusions
-        id: stage
-        run: |
-          $src = "${{ steps.inst.outputs.appdir }}"
-          $dst = "C:\Staged"
-          if (Test-Path $dst) { Remove-Item $dst -Recurse -Force }
-          New-Item -ItemType Directory -Force -Path $dst | Out-Null
-
-          # 复制时排除
-          $exclDirs  = @("__pycache__", "tests", "test", "docs", "doc", "examples", "example", "demos")
-          $exclExts  = @(".pyc", ".pyo", ".pyi", ".pdb", ".patch", ".diff", ".md", ".txt", ".rst", ".html")
-
-          $total = 0; $copied = 0; $skippedDir = 0; $skippedExt = 0
-          $log = "s-stage.log"
-          "=== 阶段复制（磁盘文件不动，只影响打包输入）===" | Out-File $log
-
-          function Copy-Filtered($cur, $rel) {
-            foreach ($f in [System.IO.Directory]::GetFiles($cur)) {
-              $script:total++
-              $nm = [System.IO.Path]::GetFileName($f)
-              $ext = [System.IO.Path]::GetExtension($f).ToLower()
-              if ($exclExts -contains $ext) { $script:skippedExt++; continue }
-              $target = Join-Path $dst (Join-Path $rel $nm)
-              $td = [System.IO.Path]::GetDirectoryName($target)
-              if (-not (Test-Path $td)) { New-Item -ItemType Directory -Force -Path $td | Out-Null }
-              [System.IO.File]::Copy($f, $target, $true)
-              $script:copied++
-            }
-            foreach ($sub in [System.IO.Directory]::GetDirectories($cur)) {
-              $nm = [System.IO.Path]::GetFileName($sub)
-              if ($exclDirs -contains $nm) { $script:skippedDir++; continue }
-              Copy-Filtered $sub (Join-Path $rel $nm)
-            }
-          }
-          Copy-Filtered $src ""
-
-          "原始文件数      : $total" | Out-File $log -Append
-          "复制的文件数    : $copied" | Out-File $log -Append
-          "排除的目录数    : $skippedDir" | Out-File $log -Append
-          "排除的扩展名文件: $skippedExt" | Out-File $log -Append
-          Get-Content $log
-          "staged=$dst" | Out-File -Append $env:GITHUB_OUTPUT
+          Write-Host "manifest + icons -> staged"
       - name: MakeAppx on staged
         continue-on-error: true
         run: |
@@ -121,11 +111,13 @@ jobs:
           if ($f) {
             Write-Host ("*** SUCCESS " + $f.FullName + " {0:N1} MB ***" -f ($f.Length/1MB))
             Copy-Item $f.FullName "dist-msix\bluefish-staged.appx" -Force
+            "RESULT=SUCCESS" | Out-File s-result.log
           } else {
             Write-Host "*** FAILED ***"
             $n = (Get-Content b1.log -ErrorAction SilentlyContinue | Where-Object { $_ -match 'as a payload file' }).Count
             Write-Host "处理文件数 = $n"
-            Get-Content b1.log -ErrorAction SilentlyContinue | Select-Object -Last 4
+            Get-Content b1.log -ErrorAction SilentlyContinue | Select-Object -Last 3
+            "RESULT=FAILED processed=$n" | Out-File s-result.log
           }
       - name: Commit logs
         if: always()
@@ -136,10 +128,10 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout --orphan diag-logs 2>/dev/null || git checkout diag-logs
           git rm -r --cached . -q 2>/dev/null || true
-          for f in s-stage.log b1.log; do [ -f "$f" ] && cp "$f" . 2>/dev/null || true; done
+          for f in s-stage.log s-result.log b1.log; do [ -f "$f" ] && cp "$f" . 2>/dev/null || true; done
           git add -f *.log 2>/dev/null || true
           git commit -m "logs run ${{ github.run_id }}" || echo "nothing"
-          git push -f origin dist-msix 2>/dev/null || git push -f origin diag-logs || echo "push failed"
+          git push -f origin diag-logs || echo "push failed"
       - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
