@@ -1,22 +1,42 @@
-name: WinApp Pack
+name: DSH Auto Build
 on:
+  schedule:
+    - cron: '37 3 * * *'
   workflow_dispatch:
     inputs:
-      mode:
-        description: 'safe = 只构建产物；auto = 构建并发布商店'
-        type: choice
-        options: [safe, auto]
-        default: safe
-  schedule:
-    - cron: '37 3 * * 1'
-  push:
-    branches: [master]
-    paths:
-      - '.github/workflows/winapp.yml'
+      force:
+        description: force build
+        type: boolean
+        default: false
 permissions:
   contents: write
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.c.outputs.changed }}
+      hash: ${{ steps.c.outputs.hash }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: c
+        run: |
+          U="https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe"
+          H=$(curl -sIL --max-time 60 "$U")
+          L=$(echo "$H" | grep -i '^content-length:' | tail -1 | tr -d '\r' | awk '{print $2}')
+          M=$(echo "$H" | grep -i '^last-modified:' | tail -1 | tr -d '\r' | cut -d' ' -f2-)
+          N="$L|$M"
+          O=""
+          [ -f .dsh-hash ] && O=$(cat .dsh-hash | tr -d '\r\n')
+          echo "new=$N old=$O force=${{ github.event.inputs.force }}"
+          if [ "${{ github.event.inputs.force }}" = "true" ] || [ "$N" != "$O" ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+          echo "hash=$N" >> $GITHUB_OUTPUT
   build:
+    needs: [check]
+    if: needs.check.outputs.changed == 'true'
     runs-on: windows-2025
     timeout-minutes: 90
     defaults:
@@ -24,141 +44,94 @@ jobs:
         shell: pwsh
     steps:
       - uses: actions/checkout@v4
-      - name: Install app silently
-        id: inst
+      - name: Install
+        id: i
         run: |
-          $tmp = "$env:RUNNER_TEMP\dsh.exe"
-          curl.exe -L --retry 3 --max-time 1800 -o $tmp "https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe"
-          if ((Get-Item $tmp).Length -lt 200MB) { throw "download too small" }
-          $t = "C:\DSHApp"
-          New-Item -ItemType Directory -Force -Path $t | Out-Null
-          Start-Process -FilePath $tmp -ArgumentList "/S","/D=$t" -Wait
+          $f = "$env:RUNNER_TEMP\d.exe"
+          curl.exe -L --retry 3 --max-time 1800 -o $f "https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe"
+          if ((Get-Item $f).Length -lt 200MB) { throw "small" }
+          New-Item -ItemType Directory -Force -Path C:\A | Out-Null
+          Start-Process $f -ArgumentList "/S","/D=C:\A" -Wait
           Start-Sleep 6
-          $exe = Get-ChildItem $t -Recurse -Filter "DeepSeek Harness.exe" | Select-Object -First 1
-          if (-not $exe) { throw "app executable not found" }
-          $n = (Get-ChildItem $t -Recurse -File -Force).Count
-          Write-Host "appdir  = $($exe.Directory.FullName)"
-          Write-Host "files   = $n"
-          "appdir=$($exe.Directory.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
-      - name: Build MSIX
-        id: pack
+          $e = Get-ChildItem C:\A -Recurse -Filter "DeepSeek Harness.exe" | Select-Object -First 1
+          if (-not $e) { throw "no exe" }
+          Write-Host "files = $((Get-ChildItem C:\A -Recurse -File -Force).Count)"
+          "d=C:\A" | Out-File -Append $env:GITHUB_OUTPUT
+      - name: Pack
         run: |
-          $src = "${{ steps.inst.outputs.appdir }}"
-          $mk  = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
-          if (-not (Test-Path $mk)) { throw "makeappx not found" }
-          $ver = "1.0.$env:GITHUB_RUN_NUMBER.0"
-          Write-Host "version = $ver"
-
-          # 阶段目录：磁盘上的 C:\DSHApp 一个文件都不动
-          $stage = "C:\Stage"
-          if (Test-Path $stage) { Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue }
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          robocopy $src $stage /E /NFL /NDL /NP /R:1 /W:1 | Out-Null
-
-          # 排除 _rels 目录（.docx 模板内部残留，MSIX 不接受）
-          $relsDirs = Get-ChildItem $stage -Directory -Recurse -Force -ErrorAction SilentlyContinue |
-                      Where-Object { $_.Name -eq "_rels" }
-          foreach ($rd in $relsDirs) {
-            Write-Host "  excluding $($rd.FullName)"
-            Remove-Item $rd.FullName -Recurse -Force -ErrorAction SilentlyContinue
-          }
-
-          # 写清单
-          $v = $ver
-          $L = @(
-          '<?xml version="1.0" encoding="utf-8"?>'
-          '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap rescap">'
-          ('  <Identity Name="14714BE0.320850A8A419A" Publisher="CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" Version="' + $v + '" ProcessorArchitecture="x64" />')
-          '  <Properties><DisplayName>BlueFish</DisplayName><PublisherDisplayName>Miku</PublisherDisplayName><Logo>Assets\StoreLogo.png</Logo></Properties>'
-          '  <Dependencies><TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.19041.0" /></Dependencies>'
-          '  <Resources><Resource Language="en-us" /></Resources>'
-          '  <Capabilities><Capability Name="internetClient" /><rescap:Capability Name="runFullTrust" /></Capabilities>'
-          '  <Applications><Application Id="App" Executable="DeepSeek Harness.exe" EntryPoint="Windows.FullTrustApplication">'
-          '    <uap:VisualElements DisplayName="BlueFish" Description="BlueFish" BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png" />'
-          '  </Application></Applications>'
-          '</Package>'
+          $d = "${{ steps.i.outputs.d }}"
+          $mk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
+          $v = "1.0.$env:GITHUB_RUN_NUMBER.0"
+          $s = "C:\S"
+          New-Item -ItemType Directory -Force -Path $s | Out-Null
+          robocopy $d $s /E /NFL /NDL /NP /R:1 /W:1 | Out-Null
+          Get-ChildItem $s -Directory -Recurse -Force | Where-Object { $_.Name -eq "_rels" } | ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+          Write-Host "staged = $((Get-ChildItem $s -Recurse -File -Force).Count)"
+          $x = @(
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap rescap">'
+            ('<Identity Name="14714BE0.320850A8A419A" Publisher="CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" Version="' + $v + '" ProcessorArchitecture="x64" />')
+            '<Properties><DisplayName>BlueFish</DisplayName><PublisherDisplayName>Miku</PublisherDisplayName><Logo>Assets\StoreLogo.png</Logo></Properties>'
+            '<Dependencies><TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.19041.0" /></Dependencies>'
+            '<Resources><Resource Language="en-us" /></Resources>'
+            '<Capabilities><Capability Name="internetClient" /><rescap:Capability Name="runFullTrust" /></Capabilities>'
+            '<Applications><Application Id="App" Executable="DeepSeek Harness.exe" EntryPoint="Windows.FullTrustApplication">'
+            '<uap:VisualElements DisplayName="BlueFish" Description="BlueFish" BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png" />'
+            '</Application></Applications></Package>'
           )
-          [System.IO.File]::WriteAllText((Join-Path $stage "AppxManifest.xml"), ($L -join "`r`n"), (New-Object System.Text.UTF8Encoding $false))
-
-          # 图标
-          $as = Join-Path $stage "Assets"
-          New-Item -ItemType Directory -Force -Path $as | Out-Null
+          [IO.File]::WriteAllText("$s\AppxManifest.xml", ($x -join "`n"), (New-Object Text.UTF8Encoding $false))
+          $a = "$s\Assets"
+          New-Item -ItemType Directory -Force -Path $a | Out-Null
           Add-Type -AssemblyName System.Drawing
-          function I($w,$h,$o) {
-            $b = New-Object System.Drawing.Bitmap $w,$h
-            $g = [System.Drawing.Graphics]::FromImage($b)
-            $g.Clear([System.Drawing.Color]::FromArgb(58,95,170))
-            $b.Save($o, [System.Drawing.Imaging.ImageFormat]::Png)
-            $g.Dispose(); $b.Dispose()
-          }
-          I 50 50 (Join-Path $as "StoreLogo.png")
-          I 44 44 (Join-Path $as "Square44x44Logo.png")
-          I 150 150 (Join-Path $as "Square150x150Logo.png")
-          I 310 150 (Join-Path $as "Wide310x150Logo.png")
-
-          # 打包
-          New-Item -ItemType Directory -Force -Path "C:\out" | Out-Null
-          $out = "C:\out\bluefish.appx"
-          Remove-Item $out -Force -ErrorAction SilentlyContinue
-          $sw = [System.Diagnostics.Stopwatch]::StartNew()
-          & $mk pack /d $stage /p $out /o 2>&1 | Tee-Object b1.log
-          $code = $LASTEXITCODE
-          $sw.Stop()
-          Write-Host "EXIT=$code  elapsed=$([math]::Round($sw.Elapsed.TotalSeconds))s"
-
-          if (-not (Test-Path $out)) {
-            Get-Content b1.log | Select-Object -Last 5
-            throw "package creation failed"
-          }
-          $mb = [math]::Round((Get-Item $out).Length/1MB,1)
-          Write-Host "*** SUCCESS  $mb MB ***"
-          if ($mb -lt 100) { throw "package too small: $mb MB" }
-
-          New-Item -ItemType Directory -Force -Path dist-msix | Out-Null
-          Copy-Item $out "dist-msix\bluefish.appx" -Force
-          "pkg=$out" | Out-File -Append $env:GITHUB_OUTPUT
-          "mb=$mb" | Out-File -Append $env:GITHUB_OUTPUT
-          "ver=$v" | Out-File -Append $env:GITHUB_OUTPUT
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+          50,44,150 | ForEach-Object { $b = New-Object Drawing.Bitmap $_,$_; $g=[Drawing.Graphics]::FromImage($b); $g.Clear([Drawing.Color]::FromArgb(58,95,170)); $b.Save("$a\L$_.png",[Drawing.Imaging.ImageFormat]::Png); $g.Dispose(); $b.Dispose() }
+          Copy-Item "$a\L50.png" "$a\StoreLogo.png" -Force
+          Copy-Item "$a\L44.png" "$a\Square44x44Logo.png" -Force
+          Copy-Item "$a\L150.png" "$a\Square150x150Logo.png" -Force
+          $b = New-Object Drawing.Bitmap 310,150
+          $g = [Drawing.Graphics]::FromImage($b); $g.Clear([Drawing.Color]::FromArgb(58,95,170))
+          $b.Save("$a\Wide310x150Logo.png",[Drawing.Imaging.ImageFormat]::Png); $g.Dispose(); $b.Dispose()
+          New-Item -ItemType Directory -Force -Path C:\out | Out-Null
+          & $mk pack /d $s /p C:\out\b.appx /o 2>&1 | Tee-Object b.log
+          if (-not (Test-Path C:\out\b.appx)) { Get-Content b.log | Select-Object -Last 5; throw "pack failed" }
+          $mb = [math]::Round((Get-Item C:\out\b.appx).Length/1MB,1)
+          Write-Host "*** OK $mb MB ver=$v ***"
+          if ($mb -lt 100) { throw "too small" }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item C:\out\b.appx dist\bluefish.appx -Force
+      - uses: actions/upload-artifact@v4
         with:
           name: dsh-msix
-          path: dist-msix/*
+          path: dist/*
           retention-days: 30
-      - name: Summary
-        if: always()
-        shell: pwsh
+      - name: Save hash
+        if: success()
+        shell: bash
+        continue-on-error: true
         run: |
-          "### DSH MSIX 构建" | Out-File $env:GITHUB_STEP_SUMMARY -Append
-          "" | Out-File $env:GITHUB_STEP_SUMMARY -Append
-          "- 版本: ${{ steps.pack.outputs.ver }}" | Out-File $env:GITHUB_STEP_SUMMARY -Append
-          "- 大小: ${{ steps.pack.outputs.mb }} MB" | Out-File $env:GITHUB_STEP_SUMMARY -Append
-          "- 模式: ${{ github.event.inputs.mode }}" | Out-File $env:GITHUB_STEP_SUMMARY -Append
-          "- 依据: 磁盘原版文件，仅排除 3 个 _rels 残留（与商店包一致）" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+          echo "${{ needs.check.outputs.hash }}" > .dsh-hash
+          git add .dsh-hash
+          git commit -m "hash [skip ci]" || true
+          git push || true
   publish:
-    needs: build
-    if: ${{ github.event.inputs.mode == 'auto' }}
+    needs: [build]
+    if: needs.build.result == 'success' && secrets.STORE_PRODUCT_ID != ''
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: microsoft/microsoft-store-apppublisher@v1.1
-      - name: Configure
-        run: |
+      - run: |
           msstore reconfigure `
             --tenantId ${{ secrets.AZURE_AD_TENANT_ID }} `
             --sellerId ${{ secrets.SELLER_ID }} `
             --clientId ${{ secrets.AZURE_AD_APPLICATION_CLIENT_ID }} `
             --clientSecret ${{ secrets.AZURE_AD_APPLICATION_SECRET }}
-      - name: Download artifact
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: dsh-msix
-          path: ./release
-      - name: Publish
-        shell: pwsh
+          path: ./r
+      - shell: pwsh
         run: |
-          $p = Get-ChildItem ./release -Include *.appx,*.msix -Recurse | Select-Object -First 1
-          Write-Host "publishing $($p.FullName)"
-          msstore publish "$($p.FullName)" `
-            -id ${{ secrets.STORE_PRODUCT_ID }} `
-            --packageRolloutPercentage 5
+          $p = Get-ChildItem ./r -Include *.appx,*.msix -Recurse | Select-Object -First 1
+          msstore publish "$($p.FullName)" -id ${{ secrets.STORE_PRODUCT_ID }} --packageRolloutPercentage 5
