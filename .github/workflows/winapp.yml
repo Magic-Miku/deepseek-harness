@@ -25,15 +25,15 @@ jobs:
           $exe = Get-ChildItem $t -Recurse -Filter "DeepSeek Harness.exe" | Select-Object -First 1
           if (-not $exe) { throw "no exe" }
           "appdir=$($exe.Directory.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
-      - name: Confirm culprit file
+      - name: Test dot-prefixed filenames
         continue-on-error: true
         run: |
           $ErrorActionPreference = "Continue"
           $src = "${{ steps.inst.outputs.appdir }}"
           $mk  = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
           $ver = "1.0.$env:GITHUB_RUN_NUMBER.0"
-          $sum = "s-culprit.log"
-          "=== confirm culprit ===" | Out-File $sum -Encoding UTF8
+          $sum = "s-dot.log"
+          "=== .rels / 点开头文件测试 ===" | Out-File $sum -Encoding UTF8
 
           $full = "C:\Full"
           if (Test-Path $full) { Remove-Item $full -Recurse -Force -ErrorAction SilentlyContinue }
@@ -41,14 +41,13 @@ jobs:
 
           $alpha = @(Get-ChildItem $full -Recurse -File -Force |
                      Where-Object { $_.Name -ne "AppxManifest.xml" } | Sort-Object FullName)
-          $N = $alpha.Count
-          "total = $N" | Out-File $sum -Append -Encoding UTF8
+          "total = $($alpha.Count)" | Out-File $sum -Append -Encoding UTF8
 
-          # 找出所有带方括号的文件
-          $brackets = @($alpha | Where-Object { $_.Name -match '\[' -or $_.Name -match '\]' })
-          "带方括号的文件数 = $($brackets.Count)" | Out-File $sum -Append -Encoding UTF8
-          foreach ($b in $brackets) {
-            "  " + $b.FullName.Substring($full.Length) | Out-File $sum -Append -Encoding UTF8
+          # 找出所有"点开头"或"无扩展名主体"的文件
+          $dots = @($alpha | Where-Object { $_.Name.StartsWith(".") })
+          "点开头的文件数 = $($dots.Count)" | Out-File $sum -Append -Encoding UTF8
+          foreach ($d in $dots) {
+            "  " + $d.FullName.Substring($full.Length) + "   " + $d.Length | Out-File $sum -Append -Encoding UTF8
           }
           "" | Out-File $sum -Append -Encoding UTF8
 
@@ -68,16 +67,13 @@ jobs:
           $manifest = $mlines -join "`r`n"
           Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
 
-          function PrepStage($list, $renameBrackets) {
+          function RunPack($label, $list) {
             $stage = "C:\S"
             if (Test-Path $stage) { Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue }
             New-Item -ItemType Directory -Force -Path $stage | Out-Null
             foreach ($f in $list) {
               try {
                 $rel = $f.FullName.Substring($full.Length).TrimStart('\')
-                if ($renameBrackets -and ($f.Name -match '\[' -or $f.Name -match '\]')) {
-                  $rel = $rel -replace '\[', '(' -replace '\]', ')'
-                }
                 $tgt = Join-Path $stage $rel
                 $td  = [System.IO.Path]::GetDirectoryName($tgt)
                 if (-not (Test-Path $td)) { New-Item -ItemType Directory -Force -Path $td -ErrorAction SilentlyContinue | Out-Null }
@@ -96,45 +92,46 @@ jobs:
                 $g.Dispose(); $b.Dispose()
               } catch {}
             }
-          }
-
-          function RunPack($label, $list, $renameBrackets) {
-            PrepStage $list $renameBrackets
-            $stage = "C:\S"
-            $out = "C:\out\$label.appx"
+            $out = "C:\out\x.appx"
             New-Item -ItemType Directory -Force -Path "C:\out" | Out-Null
             Remove-Item $out -Force -ErrorAction SilentlyContinue
             $log = & $mk pack /d $stage /p $out /o 2>&1
             $ok = Test-Path $out
-            $pk = "-"
-            if ($ok) { $pk = [string][math]::Round((Get-Item $out).Length/1MB,1) + "MB" }
+            $n = (Get-ChildItem $stage -Recurse -File -Force).Count
             $st = "FAIL"
             if ($ok) { $st = "OK" }
-            $n = (Get-ChildItem $stage -Recurse -File -Force).Count
-            $line = $label + "  n=" + $n + "  -> " + $st + "  pkg=" + $pk
+            $pk = "-"
+            if ($ok) { $pk = [string][math]::Round((Get-Item $out).Length/1MB,1) + "MB" }
+            $line = $label.PadRight(24) + " n=" + $n.ToString().PadLeft(5) + "  -> " + $st.PadRight(5) + " pkg=" + $pk
             Write-Host $line
             $line | Out-File $sum -Append -Encoding UTF8
             if (-not $ok) {
               $e = ($log | Where-Object { $_ -match 'error' } | Select-Object -Last 1)
               if ($e) { ("      " + $e.Trim()) | Out-File $sum -Append -Encoding UTF8 }
             }
-            if ($ok) { Copy-Item $out ("$env:GITHUB_WORKSPACE\dist-msix\$label.appx") -Force -ErrorAction SilentlyContinue }
+            if ($ok -and $label -eq "D_final") {
+              New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\dist-msix" | Out-Null
+              Copy-Item $out "$env:GITHUB_WORKSPACE\dist-msix\bluefish.appx" -Force
+            }
+            Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
             Remove-Item $out -Force -ErrorAction SilentlyContinue
+            return $ok
           }
 
-          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\dist-msix" | Out-Null
+          $noDots = @($alpha | Where-Object { -not $_.Name.StartsWith(".") })
+          $onlyDots = @($alpha | Where-Object { $_.Name.StartsWith(".") })
 
-          $theBracketFile = $brackets | Select-Object -First 1
-          $withoutBracket = @($alpha | Where-Object { $_.FullName -ne $theBracketFile.FullName })
+          "A_all_original" | Out-File $sum -Append -Encoding UTF8
+          RunPack "A_all" $alpha | Out-Null
 
-          "#A 全部文件，但排除那个方括号文件" | Out-File $sum -Append -Encoding UTF8
-          RunPack "A_no_bracket" $withoutBracket $false
+          "B_exclude_dot_files (排除点开头)" | Out-File $sum -Append -Encoding UTF8
+          RunPack "B_no_dots" $noDots | Out-Null
 
-          "#B 全部文件，把方括号改名成圆括号" | Out-File $sum -Append -Encoding UTF8
-          RunPack "B_renamed" $alpha $true
+          "C_only_dot_files (只要点开头)" | Out-File $sum -Append -Encoding UTF8
+          RunPack "C_only_dots" $onlyDots | Out-Null
 
-          "#C 全量原样（对照，应失败）" | Out-File $sum -Append -Encoding UTF8
-          RunPack "C_control" $alpha $false
+          "D_final (完整包，排除点开头文件)" | Out-File $sum -Append -Encoding UTF8
+          RunPack "D_final" $noDots | Out-Null
 
           "=== end ===" | Out-File $sum -Append -Encoding UTF8
           Get-Content $sum
@@ -147,9 +144,9 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout --orphan diag-logs 2>/dev/null || git checkout diag-logs
           git rm -r --cached . -q 2>/dev/null || true
-          [ -f s-culprit.log ] && cp s-culprit.log . || true
+          [ -f s-dot.log ] && cp s-dot.log . || true
           git add -f *.log 2>/dev/null || true
-          git commit -m "culprit ${{ github.run_id }}" || echo "nothing"
+          git commit -m "dot ${{ github.run_id }}" || echo "nothing"
           git push -f origin diag-logs || echo "push failed"
       - name: Upload
         if: always()
@@ -164,6 +161,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: winapp-logs
-          path: s-culprit.log
+          path: s-dot.log
           if-no-files-found: warn
           retention-days: 14
