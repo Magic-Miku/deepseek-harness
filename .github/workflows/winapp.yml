@@ -64,25 +64,6 @@ jobs:
           git commit -m "chore: heartbeat [skip ci]"
           git pull --rebase --autostash origin master || echo "rebase failed"
           git push || echo "push failed"
-      - name: Prune old artifacts
-        if: always()
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          KEEP=2
-          echo "=== 当前 artifact ==="
-          gh api "repos/$REPO/actions/artifacts?per_page=100" --jq '.artifacts[] | "\(.id) \(.created_at) \(.name)"' > /tmp/arts.txt || true
-          COUNT=$(wc -l < /tmp/arts.txt)
-          echo "总数: $COUNT  (保留最新 $KEEP 个)"
-          if [ "$COUNT" -le "$KEEP" ]; then echo "无需清理"; exit 0; fi
-          tail -n +$((KEEP+1)) /tmp/arts.txt | while read -r ID REST; do
-            echo "删除 $ID"
-            gh api -X DELETE "repos/$REPO/actions/artifacts/$ID" || true
-          done
-          echo "=== 清理后 ==="
-          gh api "repos/$REPO/actions/artifacts?per_page=100" --jq '"剩余 \(.total_count) 个"' || true
   build:
     needs: [check]
     if: needs.check.outputs.changed == 'true'
@@ -230,7 +211,8 @@ jobs:
           Copy-Item "$out\b.appx" "dist\bluefish.appx" -Force
           "ver=$v" | Out-File -Append $env:GITHUB_OUTPUT
           "mb=$mb" | Out-File -Append $env:GITHUB_OUTPUT
-      - name: Publish to Release
+      - name: Create Release
+        id: rel
         if: success()
         continue-on-error: true
         shell: pwsh
@@ -238,9 +220,25 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $tag = "v1.0.$env:GITHUB_RUN_NUMBER"
+          $repo = "${{ github.repository }}"
           Write-Host "creating release $tag"
-          gh release create $tag "dist\bluefish.appx" --title "1.0.$env:GITHUB_RUN_NUMBER.0" --notes "Auto-built from DeepSeek upstream" --clobber
-          if ($LASTEXITCODE -ne 0) { Write-Host "release create failed" }
+          gh release create $tag "dist\bluefish.appx" `
+            --repo $repo `
+            --title "蓝色大肥鱼 1.0.$env:GITHUB_RUN_NUMBER.0" `
+            --notes "Auto-built from DeepSeek upstream`npackage: bluefish.appx" `
+            --latest
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
+          $url = "https://github.com/$repo/releases/download/$tag/bluefish.appx"
+          Write-Host "DIRECT URL = $url"
+          "url=$url" | Out-File -Append $env:GITHUB_OUTPUT
+      - name: Upload artifact (fallback only)
+        if: steps.rel.outcome != 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-msix
+          path: dist/*
+          if-no-files-found: warn
+          retention-days: 7
       - name: Cleanup old releases
         if: always()
         continue-on-error: true
@@ -248,13 +246,20 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          $repo = "${{ github.repository }}"
           $keep = "v1.0.$env:GITHUB_RUN_NUMBER"
-          $tags = gh release list --limit 100 --json tagName --jq ".[].tagName"
+          $tags = gh release list --repo $repo --limit 100 --json tagName --jq ".[].tagName"
+          $kept = 0
           foreach ($t in $tags) {
-            if ($t -and $t -ne $keep) {
-              Write-Host "deleting old release $t"
-              gh release delete $t --yes --cleanup-tag
+            if (-not $t) { continue }
+            if ($t -eq $keep) { $kept++; continue }
+            if ($kept -lt 2) {
+              Write-Host "keep older release $t"
+              $kept++
+              continue
             }
+            Write-Host "delete old release $t"
+            gh release delete $t --repo $repo --yes --cleanup-tag
           }
       - name: Save hash
         if: success()
@@ -273,7 +278,11 @@ jobs:
         if: success()
         shell: pwsh
         run: |
-          $dlUrl = "https://github.com/Magic-Miku/deepseek-harness/releases/download/v1.0.${{ github.run_number }}/bluefish.appx"
+          $url = "${{ steps.rel.outputs.url }}"
+          $runUrl = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if (-not $url) {
+            $url = "(Release 未生成，请到 Actions 页下载 artifact)" + "`n" + $runUrl
+          }
           $L = @(
             "DeepSeek Harness 新包已构建完成。",
             "",
@@ -284,7 +293,7 @@ jobs:
             "",
             "点这个链接（浏览器立即开始下载）：",
             "",
-            $dlUrl,
+            $url,
             "",
             "===== 第 2 步：上传商店 =====",
             "",
@@ -307,12 +316,18 @@ jobs:
         if: failure()
         shell: pwsh
         run: |
-          $runUrl = "https://github.com/Magic-Miku/deepseek-harness/actions/runs/${{ github.run_id }}"
+          $runUrl = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           $L = @(
             "DSH 自动构建失败了，需要你检查一下。",
             "",
             "版本: 1.0.${{ github.run_number }}.0",
             "上游指纹: ${{ needs.check.outputs.hash }}",
+            "",
+            "常见原因:",
+            "  1. DeepSeek 改了安装包结构",
+            "  2. 下载中断或大小不符",
+            "  3. 安装未完成",
+            "  4. makeappx 打包失败",
             "",
             "查看日志:",
             $runUrl,
