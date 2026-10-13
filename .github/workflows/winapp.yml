@@ -25,15 +25,15 @@ jobs:
           $exe = Get-ChildItem $t -Recurse -Filter "DeepSeek Harness.exe" | Select-Object -First 1
           if (-not $exe) { throw "no exe" }
           "appdir=$($exe.Directory.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
-      - name: Bisect 3500-3600
+      - name: Confirm culprit file
         continue-on-error: true
         run: |
           $ErrorActionPreference = "Continue"
-          $src  = "${{ steps.inst.outputs.appdir }}"
-          $mk   = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
-          $ver  = "1.0.$env:GITHUB_RUN_NUMBER.0"
-          $sum  = "s-bisect.log"
-          "=== bisect 3500-3600 ===" | Out-File $sum -Encoding UTF8
+          $src = "${{ steps.inst.outputs.appdir }}"
+          $mk  = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
+          $ver = "1.0.$env:GITHUB_RUN_NUMBER.0"
+          $sum = "s-culprit.log"
+          "=== confirm culprit ===" | Out-File $sum -Encoding UTF8
 
           $full = "C:\Full"
           if (Test-Path $full) { Remove-Item $full -Recurse -Force -ErrorAction SilentlyContinue }
@@ -43,8 +43,12 @@ jobs:
                      Where-Object { $_.Name -ne "AppxManifest.xml" } | Sort-Object FullName)
           $N = $alpha.Count
           "total = $N" | Out-File $sum -Append -Encoding UTF8
-          for ($i = 3498; $i -lt 3600; $i++) {
-            "  [$($i+1)] " + $alpha[$i].FullName.Substring($full.Length) + "  " + $alpha[$i].Length | Out-File $sum -Append -Encoding UTF8
+
+          # 找出所有带方括号的文件
+          $brackets = @($alpha | Where-Object { $_.Name -match '\[' -or $_.Name -match '\]' })
+          "带方括号的文件数 = $($brackets.Count)" | Out-File $sum -Append -Encoding UTF8
+          foreach ($b in $brackets) {
+            "  " + $b.FullName.Substring($full.Length) | Out-File $sum -Append -Encoding UTF8
           }
           "" | Out-File $sum -Append -Encoding UTF8
 
@@ -64,15 +68,16 @@ jobs:
           $manifest = $mlines -join "`r`n"
           Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
 
-          $script:results = @()
-
-          function TryPack($label, $list) {
+          function PrepStage($list, $renameBrackets) {
             $stage = "C:\S"
             if (Test-Path $stage) { Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue }
             New-Item -ItemType Directory -Force -Path $stage | Out-Null
             foreach ($f in $list) {
               try {
                 $rel = $f.FullName.Substring($full.Length).TrimStart('\')
+                if ($renameBrackets -and ($f.Name -match '\[' -or $f.Name -match '\]')) {
+                  $rel = $rel -replace '\[', '(' -replace '\]', ')'
+                }
                 $tgt = Join-Path $stage $rel
                 $td  = [System.IO.Path]::GetDirectoryName($tgt)
                 if (-not (Test-Path $td)) { New-Item -ItemType Directory -Force -Path $td -ErrorAction SilentlyContinue | Out-Null }
@@ -91,50 +96,45 @@ jobs:
                 $g.Dispose(); $b.Dispose()
               } catch {}
             }
-            $rawMB = [math]::Round((($list | Measure-Object Length -Sum).Sum)/1MB, 1)
-            $cnt   = (Get-ChildItem $stage -Recurse -File -Force).Count
-            $out   = "C:\out\$label.appx"
+          }
+
+          function RunPack($label, $list, $renameBrackets) {
+            PrepStage $list $renameBrackets
+            $stage = "C:\S"
+            $out = "C:\out\$label.appx"
             New-Item -ItemType Directory -Force -Path "C:\out" | Out-Null
             Remove-Item $out -Force -ErrorAction SilentlyContinue
-            $sw  = [System.Diagnostics.Stopwatch]::StartNew()
             $log = & $mk pack /d $stage /p $out /o 2>&1
-            $sw.Stop()
             $ok = Test-Path $out
-            $pkMB = "-"
-            if ($ok) { $pkMB = ("{0:N1}MB" -f ((Get-Item $out).Length/1MB)) }
-            $status = "FAIL"
-            if ($ok) { $status = "OK  " }
-            $line = $label.PadRight(20) + " n=" + $cnt.ToString().PadLeft(5) + "  raw=" + $rawMB.ToString().PadLeft(7) + "MB  -> " + $status + "  pkg=" + $pkMB.PadLeft(9) + "  " + [math]::Round($sw.Elapsed.TotalSeconds) + "s"
+            $pk = "-"
+            if ($ok) { $pk = [string][math]::Round((Get-Item $out).Length/1MB,1) + "MB" }
+            $st = "FAIL"
+            if ($ok) { $st = "OK" }
+            $n = (Get-ChildItem $stage -Recurse -File -Force).Count
+            $line = $label + "  n=" + $n + "  -> " + $st + "  pkg=" + $pk
             Write-Host $line
             $line | Out-File $sum -Append -Encoding UTF8
             if (-not $ok) {
               $e = ($log | Where-Object { $_ -match 'error' } | Select-Object -Last 1)
               if ($e) { ("      " + $e.Trim()) | Out-File $sum -Append -Encoding UTF8 }
             }
-            Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+            if ($ok) { Copy-Item $out ("$env:GITHUB_WORKSPACE\dist-msix\$label.appx") -Force -ErrorAction SilentlyContinue }
             Remove-Item $out -Force -ErrorAction SilentlyContinue
-            return $ok
           }
 
-          $head3500 = @($alpha | Select-Object -First 3500)
-          $r3501_3550 = @($alpha[3500..3549])
-          $r3551_3600 = @($alpha[3550..3599])
-          $tail = @($alpha | Select-Object -Skip 3600)
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\dist-msix" | Out-Null
 
-          "#1  head3500 only"       | Out-File $sum -Append -Encoding UTF8
-          TryPack "head3500" $head3500 | Out-Null
+          $theBracketFile = $brackets | Select-Object -First 1
+          $withoutBracket = @($alpha | Where-Object { $_.FullName -ne $theBracketFile.FullName })
 
-          "#2  head3500 + 3501..3550" | Out-File $sum -Append -Encoding UTF8
-          TryPack "head_plus_3501_3550" ($head3500 + $r3501_3550) | Out-Null
+          "#A 全部文件，但排除那个方括号文件" | Out-File $sum -Append -Encoding UTF8
+          RunPack "A_no_bracket" $withoutBracket $false
 
-          "#3  head3500 + 3551..3600" | Out-File $sum -Append -Encoding UTF8
-          TryPack "head_plus_3551_3600" ($head3500 + $r3551_3600) | Out-Null
+          "#B 全部文件，把方括号改名成圆括号" | Out-File $sum -Append -Encoding UTF8
+          RunPack "B_renamed" $alpha $true
 
-          "#4  head3500 + tail (skip 3501-3600)" | Out-File $sum -Append -Encoding UTF8
-          TryPack "head_plus_tail" ($head3500 + $tail) | Out-Null
-
-          "#5  full 9772 (control)" | Out-File $sum -Append -Encoding UTF8
-          TryPack "full" $alpha | Out-Null
+          "#C 全量原样（对照，应失败）" | Out-File $sum -Append -Encoding UTF8
+          RunPack "C_control" $alpha $false
 
           "=== end ===" | Out-File $sum -Append -Encoding UTF8
           Get-Content $sum
@@ -147,15 +147,23 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout --orphan diag-logs 2>/dev/null || git checkout diag-logs
           git rm -r --cached . -q 2>/dev/null || true
-          [ -f s-bisect.log ] && cp s-bisect.log . || true
+          [ -f s-culprit.log ] && cp s-culprit.log . || true
           git add -f *.log 2>/dev/null || true
-          git commit -m "bisect ${{ github.run_id }}" || echo "nothing"
+          git commit -m "culprit ${{ github.run_id }}" || echo "nothing"
           git push -f origin diag-logs || echo "push failed"
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-msix
+          path: dist-msix/*
+          if-no-files-found: warn
+          retention-days: 30
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: winapp-logs
-          path: s-bisect.log
+          path: s-culprit.log
           if-no-files-found: warn
           retention-days: 14
