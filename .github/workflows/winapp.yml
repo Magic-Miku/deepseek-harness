@@ -22,18 +22,25 @@ jobs:
         run: |
           U="https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe"
           H=$(curl -sIL --max-time 60 "$U")
-          L=$(echo "$H" | grep -i '^content-length:' | tail -1 | tr -d '\r' | awk '{print $2}')
-          M=$(echo "$H" | grep -i '^last-modified:' | tail -1 | tr -d '\r' | cut -d' ' -f2-)
-          N="$L|$M"
+          LEN=$(echo "$H" | grep -i '^content-length:' | tail -1 | tr -d '\r' | awk '{print $2}')
+          ETAG=$(echo "$H" | grep -i '^etag:' | tail -1 | tr -d '\r' | sed 's/^[Ee][Tt][Aa][Gg]: *//')
+          LM=$(echo "$H" | grep -i '^last-modified:' | tail -1 | tr -d '\r' | cut -d' ' -f2-)
+          if [ -n "$ETAG" ]; then
+            N="$LEN|$ETAG"
+          else
+            N="$LEN|$LM"
+          fi
           O=""
           [ -f .dsh-hash ] && O=$(cat .dsh-hash | tr -d '\r\n')
-          echo "new=$N old=$O"
+          echo "current  = $N"
+          echo "recorded = $O"
           if [ "${{ github.event.inputs.force }}" = "true" ] || [ "$N" != "$O" ]; then
             echo "changed=true" >> $GITHUB_OUTPUT
           else
             echo "changed=false" >> $GITHUB_OUTPUT
           fi
           echo "hash=$N" >> $GITHUB_OUTPUT
+          echo "size=$LEN" >> $GITHUB_OUTPUT
       - name: Heartbeat
         if: always()
         shell: bash
@@ -60,8 +67,10 @@ jobs:
       - name: Install
         run: |
           $f = "$env:RUNNER_TEMP\d.exe"
-          curl.exe -L --retry 3 --max-time 1800 -o $f "https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe"
-          if ((Get-Item $f).Length -lt 200MB) { throw "small" }
+          curl.exe -L --retry 5 --retry-delay 5 --retry-all-errors -C - --max-time 1800 -o $f "https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe"
+          $sz = (Get-Item $f).Length
+          Write-Host "downloaded = $sz bytes (upstream ${{ needs.check.outputs.size }})"
+          if ($sz -lt 200MB) { throw "download too small: $sz" }
           New-Item -ItemType Directory -Force -Path C:\A | Out-Null
           Start-Process $f -ArgumentList "/S","/D=C:\A" -Wait
           Start-Sleep 6
@@ -69,6 +78,7 @@ jobs:
           if (-not $e) { throw "no exe" }
           Write-Host "files = $((Get-ChildItem C:\A -Recurse -File -Force).Count)"
       - name: Pack
+        id: pack
         run: |
           $d = "C:\A"
           $mk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
@@ -140,11 +150,15 @@ jobs:
           if ($mb -lt 100) { throw "too small" }
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item C:\out\b.appx dist\bluefish.appx -Force
+          "ver=$v" | Out-File -Append $env:GITHUB_OUTPUT
+          "mb=$mb" | Out-File -Append $env:GITHUB_OUTPUT
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: dsh-msix
           path: dist/*
-          retention-days: 90
+          if-no-files-found: warn
+          retention-days: 400
       - name: Save hash
         if: success()
         shell: bash
@@ -157,7 +171,7 @@ jobs:
           git diff --cached --quiet && echo "hash unchanged" && exit 0
           git commit -m "hash [skip ci]"
           git push || true
-      - name: Send email
+      - name: Email success
         if: success()
         shell: pwsh
         run: |
@@ -166,10 +180,53 @@ jobs:
             "DeepSeek Harness 新包已构建完成。",
             "",
             "版本: 1.0.${{ github.run_number }}.0",
-            "下载: " + $runUrl,
-            "上传: https://partner.microsoft.com/dashboard/apps-and-games"
+            "大小: ${{ steps.pack.outputs.mb }} MB",
+            "",
+            "===== 下载 =====",
+            "1. 打开下面链接",
+            "2. 拉到页面最底部",
+            "3. 点 Artifacts 里的 dsh-msix 下载",
+            "",
+            $runUrl,
+            "",
+            "===== 上传商店 =====",
+            "1. 打开 https://partner.microsoft.com/dashboard/apps-and-games",
+            "2. 点蓝色大肥鱼 -> 更新",
+            "3. 上传解压出的 bluefish.appx",
+            "4. 提交认证（约 3 个工作日）",
+            "",
+            "-- GitHub Actions 自动发送"
           )
           $body = $L -join "`r`n"
           $sec = ConvertTo-SecureString "${{ secrets.QQ_AUTH_CODE }}" -AsPlainText -Force
           $cred = New-Object System.Management.Automation.PSCredential("${{ secrets.QQ_EMAIL }}", $sec)
-          Send-MailMessage -SmtpServer "smtp.qq.com" -Port 587 -UseSsl -From "${{ secrets.QQ_EMAIL }}" -To "${{ secrets.QQ_EMAIL }}" -Subject "[DSH] 新版本已就绪" -Body $body -Encoding UTF8 -Credential $cred
+          Send-MailMessage -SmtpServer "smtp.qq.com" -Port 587 -UseSsl -From "${{ secrets.QQ_EMAIL }}" -To "${{ secrets.QQ_EMAIL }}" -Subject "[DSH] 新版本已就绪，可以发布到商店了" -Body $body -Encoding UTF8 -Credential $cred
+          Write-Host "success mail sent"
+      - name: Email failure
+        if: failure()
+        shell: pwsh
+        run: |
+          $runUrl = "https://github.com/Magic-Miku/deepseek-harness/actions/runs/${{ github.run_id }}"
+          $L = @(
+            "DSH 自动构建失败了，需要你检查一下。",
+            "",
+            "版本: 1.0.${{ github.run_number }}.0",
+            "上游指纹: ${{ needs.check.outputs.hash }}",
+            "",
+            "常见原因:",
+            "  1. DeepSeek 改了安装包结构（比如多了 _rels 之类）",
+            "  2. 下载中断（已开断点续传，重跑通常能过）",
+            "  3. makeappx 打包失败",
+            "",
+            "查看日志:",
+            $runUrl,
+            "",
+            "提示: 如果重跑仍然失败，把日志发出来排查。",
+            "",
+            "-- GitHub Actions 自动发送"
+          )
+          $body = $L -join "`r`n"
+          $sec = ConvertTo-SecureString "${{ secrets.QQ_AUTH_CODE }}" -AsPlainText -Force
+          $cred = New-Object System.Management.Automation.PSCredential("${{ secrets.QQ_EMAIL }}", $sec)
+          Send-MailMessage -SmtpServer "smtp.qq.com" -Port 587 -UseSsl -From "${{ secrets.QQ_EMAIL }}" -To "${{ secrets.QQ_EMAIL }}" -Subject "[DSH] 构建失败，需要检查" -Body $body -Encoding UTF8 -Credential $cred
+          Write-Host "failure mail sent"
