@@ -34,7 +34,6 @@ jobs:
         run: |
           $d = "${{ steps.inst.outputs.appdir }}"
           $v = "1.0.$env:GITHUB_RUN_NUMBER.0"
-          Write-Host "version = $v"
           $L = @(
           '<?xml version="1.0" encoding="utf-8"?>'
           '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap rescap">'
@@ -64,73 +63,69 @@ jobs:
           I 150 150 (Join-Path $a "Square150x150Logo.png")
           I 310 150 (Join-Path $a "Wide310x150Logo.png")
           Write-Host "manifest + icons done"
-      - name: Test multiple makeappx parameter combos
+      - name: Stage with aggressive exclusions
+        id: stage
+        run: |
+          $src = "${{ steps.inst.outputs.appdir }}"
+          $dst = "C:\Staged"
+          if (Test-Path $dst) { Remove-Item $dst -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+
+          # 复制时排除
+          $exclDirs  = @("__pycache__", "tests", "test", "docs", "doc", "examples", "example", "demos")
+          $exclExts  = @(".pyc", ".pyo", ".pyi", ".pdb", ".patch", ".diff", ".md", ".txt", ".rst", ".html")
+
+          $total = 0; $copied = 0; $skippedDir = 0; $skippedExt = 0
+          $log = "s-stage.log"
+          "=== 阶段复制（磁盘文件不动，只影响打包输入）===" | Out-File $log
+
+          function Copy-Filtered($cur, $rel) {
+            foreach ($f in [System.IO.Directory]::GetFiles($cur)) {
+              $script:total++
+              $nm = [System.IO.Path]::GetFileName($f)
+              $ext = [System.IO.Path]::GetExtension($f).ToLower()
+              if ($exclExts -contains $ext) { $script:skippedExt++; continue }
+              $target = Join-Path $dst (Join-Path $rel $nm)
+              $td = [System.IO.Path]::GetDirectoryName($target)
+              if (-not (Test-Path $td)) { New-Item -ItemType Directory -Force -Path $td | Out-Null }
+              [System.IO.File]::Copy($f, $target, $true)
+              $script:copied++
+            }
+            foreach ($sub in [System.IO.Directory]::GetDirectories($cur)) {
+              $nm = [System.IO.Path]::GetFileName($sub)
+              if ($exclDirs -contains $nm) { $script:skippedDir++; continue }
+              Copy-Filtered $sub (Join-Path $rel $nm)
+            }
+          }
+          Copy-Filtered $src ""
+
+          "原始文件数      : $total" | Out-File $log -Append
+          "复制的文件数    : $copied" | Out-File $log -Append
+          "排除的目录数    : $skippedDir" | Out-File $log -Append
+          "排除的扩展名文件: $skippedExt" | Out-File $log -Append
+          Get-Content $log
+          "staged=$dst" | Out-File -Append $env:GITHUB_OUTPUT
+      - name: MakeAppx on staged
         continue-on-error: true
         run: |
-          $d = "${{ steps.inst.outputs.appdir }}"
+          $st = "${{ steps.stage.outputs.staged }}"
           $mk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
           New-Item -ItemType Directory -Force -Path "C:\out" | Out-Null
           New-Item -ItemType Directory -Force -Path dist-msix | Out-Null
-          $summary = "s-summary.log"
-
-          # 参数组合列表
-          $combos = @(
-            @{ n = "A_default";      args = @("/d", $d, "/o") },
-            @{ n = "B_nc";           args = @("/d", $d, "/o", "/nc") },
-            @{ n = "C_nv";           args = @("/d", $d, "/o", "/nv") },
-            @{ n = "D_nc_nv";        args = @("/d", $d, "/o", "/nc", "/nv") },
-            @{ n = "E_nc_nv_sha256"; args = @("/d", $d, "/o", "/nc", "/nv", "/h", "SHA256") }
-          )
-
-          "=== 参数组合测试 ===" | Out-File $summary
-          "" | Out-File $summary -Append
-
-          foreach ($c in $combos) {
-            $out = "C:\out\$($c.n).appx"
-            $log = "b-$($c.n).log"
-            Remove-Item $out -Force -ErrorAction SilentlyContinue
-
-            Write-Host ""
-            Write-Host "=========================================="
-            Write-Host "测试: $($c.n)   参数: $($c.args -join ' ')"
-            Write-Host "=========================================="
-
-            $allArgs = $c.args + @("/p", $out)
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
-            & $mk pack @allArgs 2>&1 | Out-File $log
-            $code = $LASTEXITCODE
-            $sw.Stop()
-
-            $ok = (Test-Path $out)
-            $mb = if ($ok) { [math]::Round((Get-Item $out).Length/1MB,1) } else { 0 }
-            $elapsed = [math]::Round($sw.Elapsed.TotalSeconds)
-
-            Write-Host "  EXIT=$code  耗时=${elapsed}s  产物=$(if($ok){"$mb MB"}else{"无"})"
-
-            if ($ok) {
-              "$($c.n): SUCCESS  ${mb}MB  ${elapsed}s" | Out-File $summary -Append
-              Copy-Item $out "dist-msix\bluefish-$($c.n).appx" -Force
-            } else {
-              $err = (Get-Content $log -ErrorAction SilentlyContinue | Where-Object { $_ -match 'error' } | Select-Object -Last 1)
-              "$($c.n): FAILED   ${elapsed}s   $err" | Out-File $summary -Append
-            }
-          }
-
-          "" | Out-File $summary -Append
-          "=== 汇总 ===" | Out-File $summary -Append
-          Get-Content $summary
-      - name: Also try winapp pack
-        continue-on-error: true
-        run: |
-          $d = "${{ steps.inst.outputs.appdir }}"
-          New-Item -ItemType Directory -Force -Path "C:\outw" | Out-Null
-          winapp pack $d --no-sign --output "C:\outw\winapp.msix" 2>&1 | Tee-Object b-winapp.log
-          $f = Get-ChildItem "C:\outw" -Include *.msix,*.appx -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          $sw = [System.Diagnostics.Stopwatch]::StartNew()
+          & $mk pack /d $st /p "C:\out\staged.appx" /o 2>&1 | Tee-Object b1.log
+          $code = $LASTEXITCODE
+          $sw.Stop()
+          Write-Host "EXIT=$code  elapsed=$([math]::Round($sw.Elapsed.TotalSeconds))s"
+          $f = Get-ChildItem "C:\out" -Include *.appx -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($f) {
-            Write-Host "*** WINAPP SUCCESS ***"
-            Copy-Item $f.FullName "dist-msix\bluefish-winapp.msix" -Force
+            Write-Host ("*** SUCCESS " + $f.FullName + " {0:N1} MB ***" -f ($f.Length/1MB))
+            Copy-Item $f.FullName "dist-msix\bluefish-staged.appx" -Force
           } else {
-            Write-Host "winapp failed"
+            Write-Host "*** FAILED ***"
+            $n = (Get-Content b1.log -ErrorAction SilentlyContinue | Where-Object { $_ -match 'as a payload file' }).Count
+            Write-Host "处理文件数 = $n"
+            Get-Content b1.log -ErrorAction SilentlyContinue | Select-Object -Last 4
           }
       - name: Commit logs
         if: always()
@@ -141,14 +136,10 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout --orphan diag-logs 2>/dev/null || git checkout diag-logs
           git rm -r --cached . -q 2>/dev/null || true
-          find . -maxdepth 1 -name "*.log" -exec cp {} /tmp/ \; 2>/dev/null || true
-          ls -la /tmp/*.log 2>/dev/null || true
-          for f in s-summary.log b-A_default.log b-B_nc.log b-C_nv.log b-D_nc_nv.log b-E_nc_nv_sha256.log b-winapp.log; do
-            [ -f "$f" ] && cp "$f" . 2>/dev/null || true
-          done
+          for f in s-stage.log b1.log; do [ -f "$f" ] && cp "$f" . 2>/dev/null || true; done
           git add -f *.log 2>/dev/null || true
           git commit -m "logs run ${{ github.run_id }}" || echo "nothing"
-          git push -f origin diag-logs || echo "push failed"
+          git push -f origin dist-msix 2>/dev/null || git push -f origin diag-logs || echo "push failed"
       - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
