@@ -64,6 +64,24 @@ jobs:
           git commit -m "chore: heartbeat [skip ci]"
           git pull --rebase --autostash origin master || echo "rebase failed"
           git push || echo "push failed"
+      - name: Prune old artifacts
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "=== 当前 artifact ==="
+          gh api "repos/$REPO/actions/artifacts?per_page=100" --jq '.artifacts[] | "\(.id) \(.created_at) \(.name)"' > /tmp/arts.txt || true
+          COUNT=$(wc -l < /tmp/arts.txt)
+          echo "总数: $COUNT"
+          while read -r ID REST; do
+            [ -z "$ID" ] && continue
+            echo "删除 artifact $ID"
+            gh api -X DELETE "repos/$REPO/actions/artifacts/$ID" || true
+          done < /tmp/arts.txt
+          echo "=== 清理后 ==="
+          gh api "repos/$REPO/actions/artifacts?per_page=100" --jq '"剩余 \(.total_count) 个"' || true
   build:
     needs: [check]
     if: needs.check.outputs.changed == 'true'
@@ -211,7 +229,7 @@ jobs:
           Copy-Item "$out\b.appx" "dist\bluefish.appx" -Force
           "ver=$v" | Out-File -Append $env:GITHUB_OUTPUT
           "mb=$mb" | Out-File -Append $env:GITHUB_OUTPUT
-      - name: Create Release
+      - name: Publish Release (latest)
         id: rel
         if: success()
         continue-on-error: true
@@ -219,14 +237,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $tag = "v1.0.$env:GITHUB_RUN_NUMBER"
           $repo = "${{ github.repository }}"
-          Write-Host "creating release $tag"
+          $tag = "latest"
+          $v = "1.0.$env:GITHUB_RUN_NUMBER.0"
+          Write-Host "publishing latest (version $v)"
+          gh release delete $tag --repo $repo --yes --cleanup-tag 2>$null
           gh release create $tag "dist\bluefish.appx" `
             --repo $repo `
-            --title "蓝色大肥鱼 1.0.$env:GITHUB_RUN_NUMBER.0" `
-            --notes "Auto-built from DeepSeek upstream`npackage: bluefish.appx" `
-            --latest
+            --title "蓝色大肥鱼 $v（最新）" `
+            --notes "版本: $v`nfrom: DeepSeek upstream`nbuild: ${{ github.run_number }}"
           if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
           $url = "https://github.com/$repo/releases/download/$tag/bluefish.appx"
           Write-Host "DIRECT URL = $url"
@@ -239,28 +258,6 @@ jobs:
           path: dist/*
           if-no-files-found: warn
           retention-days: 7
-      - name: Cleanup old releases
-        if: always()
-        continue-on-error: true
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $repo = "${{ github.repository }}"
-          $keep = "v1.0.$env:GITHUB_RUN_NUMBER"
-          $tags = gh release list --repo $repo --limit 100 --json tagName --jq ".[].tagName"
-          $kept = 0
-          foreach ($t in $tags) {
-            if (-not $t) { continue }
-            if ($t -eq $keep) { $kept++; continue }
-            if ($kept -lt 2) {
-              Write-Host "keep older release $t"
-              $kept++
-              continue
-            }
-            Write-Host "delete old release $t"
-            gh release delete $t --repo $repo --yes --cleanup-tag
-          }
       - name: Save hash
         if: success()
         shell: bash
@@ -281,7 +278,7 @@ jobs:
           $url = "${{ steps.rel.outputs.url }}"
           $runUrl = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           if (-not $url) {
-            $url = "(Release 未生成，请到 Actions 页下载 artifact)" + "`n" + $runUrl
+            $url = "(Release 未生成，请到 Actions 页下载 artifact)`n$runUrl"
           }
           $L = @(
             "DeepSeek Harness 新包已构建完成。",
@@ -291,7 +288,7 @@ jobs:
             "",
             "===== 第 1 步：下载 =====",
             "",
-            "点这个链接（浏览器立即开始下载）：",
+            "点这个链接（浏览器立即开始下载，永远是最新版）：",
             "",
             $url,
             "",
