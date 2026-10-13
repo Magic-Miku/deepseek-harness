@@ -29,47 +29,22 @@ jobs:
           $n = (Get-ChildItem $target -Recurse -File -ErrorAction SilentlyContinue).Count
           Write-Host "appdir = $($exe.Directory.FullName)  files = $n"
           "appdir=$($exe.Directory.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
-      - name: Prepare manifest template
-        id: mf
-        run: |
-          $d = "${{ steps.inst.outputs.appdir }}"
-          $v = "1.0.$env:GITHUB_RUN_NUMBER.0"
-          $L = @(
-          '<?xml version="1.0" encoding="utf-8"?>'
-          '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap rescap">'
-          ('  <Identity Name="14714BE0.320850A8A419A" Publisher="CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" Version="' + $v + '" ProcessorArchitecture="x64" />')
-          '  <Properties><DisplayName>BlueFish</DisplayName><PublisherDisplayName>Miku</PublisherDisplayName><Logo>Assets\StoreLogo.png</Logo></Properties>'
-          '  <Dependencies><TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.19041.0" /></Dependencies>'
-          '  <Resources><Resource Language="en-us" /></Resources>'
-          '  <Capabilities><Capability Name="internetClient" /><rescap:Capability Name="runFullTrust" /></Capabilities>'
-          '  <Applications><Application Id="App" Executable="DeepSeek Harness.exe" EntryPoint="Windows.FullTrustApplication">'
-          '    <uap:VisualElements DisplayName="BlueFish" Description="BlueFish" BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png" />'
-          '  </Application></Applications>'
-          '</Package>'
-          )
-          [System.IO.File]::WriteAllText("$env:GITHUB_WORKSPACE\manifest-template.xml", ($L -join "`r`n"), (New-Object System.Text.UTF8Encoding $false))
-          Write-Host "version = $v"
-          Write-Host "manifest template ready"
-      - name: Threshold scan - 4000 / 4500 / 4900 / 5100
+      - name: Threshold scan
         continue-on-error: true
         run: |
           $src = "${{ steps.inst.outputs.appdir }}"
           $mk = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Filter makeappx.exe -Recurse -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -match "\\x64\\" } | Sort-Object FullName -Descending | Select-Object -First 1
           Write-Host "makeappx = $($mk.FullName)"
+          $ver = "1.0.$env:GITHUB_RUN_NUMBER.0"
           New-Item -ItemType Directory -Force -Path "C:\out" | Out-Null
+          New-Item -ItemType Directory -Force -Path dist-msix | Out-Null
 
-          # 收集所有文件（不包含 manifest，稍后单独加）
-          Write-Host "枚举文件..."
-          $allFiles = Get-ChildItem $src -Recurse -File -Force -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -ne "AppxManifest.xml" }
-          $total = $allFiles.Count
+          $all = Get-ChildItem $src -Recurse -File -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne "AppxManifest.xml" } | Sort-Object FullName
+          $total = $all.Count
           Write-Host "总文件数 = $total"
 
-          # 排序保证确定性
-          $allFiles = $allFiles | Sort-Object FullName
-
-          New-Item -ItemType Directory -Force -Path dist-msix | Out-Null
           $summary = "s-scan.log"
           "=== 阈值扫描 ===" | Out-File $summary
           "总文件数: $total" | Out-File $summary -Append
@@ -81,31 +56,49 @@ jobs:
             if (Test-Path $stage) { Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue }
             New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
-            # 复制前 N 个文件，保持相对路径
-            $take = $allFiles | Select-Object -First $limit
-            foreach ($f in $take) {
+            foreach ($f in ($all | Select-Object -First $limit)) {
               $rel = $f.FullName.Substring($src.Length).TrimStart('\')
               $tgt = Join-Path $stage $rel
               $td = [System.IO.Path]::GetDirectoryName($tgt)
               if (-not (Test-Path $td)) { New-Item -ItemType Directory -Force -Path $td | Out-Null }
               Copy-Item $f.FullName $tgt -Force -ErrorAction SilentlyContinue
             }
-            # 加 manifest 和图标
-            Copy-Item "$env:GITHUB_WORKSPACE\manifest-template.xml" (Join-Path $stage "AppxManifest.xml") -Force
-            $assetsSrc = Join-Path $src "Assets"
-            $assetsDst = Join-Path $stage "Assets"
-            New-Item -ItemType Directory -Force -Path $assetsDst | Out-Null
-            if (Test-Path $assetsSrc) {
-              Get-ChildItem $assetsSrc -File -ErrorAction SilentlyContinue | ForEach-Object {
-                Copy-Item $_.FullName (Join-Path $assetsDst $_.Name) -Force -ErrorAction SilentlyContinue
-              }
-            }
-            $realCount = (Get-ChildItem $stage -Recurse -File -Force -ErrorAction SilentlyContinue).Count
 
+            # ★ 现场生成 manifest（用已验证的写法）
+            $L = @(
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap rescap">'
+            ('  <Identity Name="14714BE0.320850A8A419A" Publisher="CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" Version="' + $ver + '" ProcessorArchitecture="x64" />')
+            '  <Properties><DisplayName>BlueFish</DisplayName><PublisherDisplayName>Miku</PublisherDisplayName><Logo>Assets\StoreLogo.png</Logo></Properties>'
+            '  <Dependencies><TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.19041.0" /></Dependencies>'
+            '  <Resources><Resource Language="en-us" /></Resources>'
+            '  <Capabilities><Capability Name="internetClient" /><rescap:Capability Name="runFullTrust" /></Capabilities>'
+            '  <Applications><Application Id="App" Executable="DeepSeek Harness.exe" EntryPoint="Windows.FullTrustApplication">'
+            '    <uap:VisualElements DisplayName="BlueFish" Description="BlueFish" BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png" />'
+            '  </Application></Applications>'
+            '</Package>'
+            )
+            [System.IO.File]::WriteAllText((Join-Path $stage "AppxManifest.xml"), ($L -join "`r`n"), (New-Object System.Text.UTF8Encoding $false))
+
+            # 图标
+            $as = Join-Path $stage "Assets"
+            New-Item -ItemType Directory -Force -Path $as | Out-Null
+            Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+            function II($w,$h,$o) {
+              $b = New-Object System.Drawing.Bitmap $w,$h
+              $g = [System.Drawing.Graphics]::FromImage($b)
+              $g.Clear([System.Drawing.Color]::FromArgb(58,95,170))
+              $b.Save($o, [System.Drawing.Imaging.ImageFormat]::Png)
+              $g.Dispose(); $b.Dispose()
+            }
+            II 50 50 (Join-Path $as "StoreLogo.png")
+            II 44 44 (Join-Path $as "Square44x44Logo.png")
+            II 150 150 (Join-Path $as "Square150x150Logo.png")
+            II 310 150 (Join-Path $as "Wide310x150Logo.png")
+
+            $real = (Get-ChildItem $stage -Recurse -File -Force -ErrorAction SilentlyContinue).Count
             Write-Host ""
-            Write-Host "=========================================="
-            Write-Host "测试 $limit （实际 $realCount 个文件）"
-            Write-Host "=========================================="
+            Write-Host "========== limit=$limit  实际=$real =========="
 
             $outPkg = "C:\out\l$limit.appx"
             Remove-Item $outPkg -Force -ErrorAction SilentlyContinue
@@ -115,20 +108,19 @@ jobs:
             $code = $LASTEXITCODE
             $sw.Stop()
             $el = [math]::Round($sw.Elapsed.TotalSeconds)
-            $processed = (Get-Content $log -ErrorAction SilentlyContinue | Where-Object { $_ -match 'as a payload file' }).Count
+            $proc = (Get-Content $log -ErrorAction SilentlyContinue | Where-Object { $_ -match 'as a payload file' }).Count
             $ok = (Test-Path $outPkg)
 
             if ($ok) {
               $mb = [math]::Round((Get-Item $outPkg).Length/1MB,1)
-              Write-Host "  *** 成功 $mb MB  (${el}s) ***"
-              "$limit : SUCCESS  ${mb}MB  processed=$processed  ${el}s" | Out-File $summary -Append
+              Write-Host "  *** SUCCESS $mb MB (${el}s) ***"
+              "$limit : SUCCESS  ${mb}MB  files=$real  processed=$proc  ${el}s" | Out-File $summary -Append
               Copy-Item $outPkg "dist-msix\bluefish-l$limit.appx" -Force
             } else {
-              $err = (Get-Content $log -ErrorAction SilentlyContinue | Where-Object { $_ -match 'error' } | Select-Object -Last 1)
-              Write-Host "  *** 失败 processed=$processed (${el}s) ***"
-              "$limit : FAILED   processed=$processed  ${el}s" | Out-File $summary -Append
+              Write-Host "  *** FAILED processed=$proc (${el}s) ***"
+              "$limit : FAILED   files=$real  processed=$proc  ${el}s" | Out-File $summary -Append
+              Get-Content $log -ErrorAction SilentlyContinue | Where-Object { $_ -match 'error' } | Select-Object -Last 1 | ForEach-Object { "       $($_.Trim())" | Out-File $summary -Append }
             }
-            # 清理暂存盘
             Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
           }
 
