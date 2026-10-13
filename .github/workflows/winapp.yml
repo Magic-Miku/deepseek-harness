@@ -10,6 +10,7 @@ on:
         default: false
 permissions:
   contents: write
+  actions: write
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -25,11 +26,7 @@ jobs:
           LEN=$(echo "$H" | grep -i '^content-length:' | tail -1 | tr -d '\r' | awk '{print $2}')
           ETAG=$(echo "$H" | grep -i '^etag:' | tail -1 | tr -d '\r' | sed 's/^[Ee][Tt][Aa][Gg]: *//')
           LM=$(echo "$H" | grep -i '^last-modified:' | tail -1 | tr -d '\r' | cut -d' ' -f2-)
-          if [ -n "$ETAG" ]; then
-            N="$LEN|$ETAG"
-          else
-            N="$LEN|$LM"
-          fi
+          if [ -n "$ETAG" ]; then N="$LEN|$ETAG"; else N="$LEN|$LM"; fi
           O=""
           [ -f .dsh-hash ] && O=$(cat .dsh-hash | tr -d '\r\n')
           echo "current  = $N"
@@ -54,6 +51,25 @@ jobs:
           git diff --cached --quiet && echo "no change" && exit 0
           git commit -m "chore: heartbeat [skip ci]"
           git push || echo "push failed"
+      - name: Prune old artifacts
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          KEEP=2
+          echo "=== 当前 artifact ==="
+          gh api "repos/$REPO/actions/artifacts?per_page=100" --jq '.artifacts[] | "\(.id) \(.created_at) \(.name)"' | tee /tmp/arts.txt
+          COUNT=$(wc -l < /tmp/arts.txt)
+          echo "总数: $COUNT  (保留最新 $KEEP 个)"
+          if [ "$COUNT" -le "$KEEP" ]; then echo "无需清理"; exit 0; fi
+          tail -n +$((KEEP+1)) /tmp/arts.txt | while read -r ID REST; do
+            echo "删除 $ID"
+            gh api -X DELETE "repos/$REPO/actions/artifacts/$ID" || true
+          done
+          echo "=== 清理后 ==="
+          gh api "repos/$REPO/actions/artifacts?per_page=100" --jq '"剩余 \(.total_count) 个"'
   build:
     needs: [check]
     if: needs.check.outputs.changed == 'true'
@@ -212,11 +228,6 @@ jobs:
             "",
             "版本: 1.0.${{ github.run_number }}.0",
             "上游指纹: ${{ needs.check.outputs.hash }}",
-            "",
-            "常见原因:",
-            "  1. DeepSeek 改了安装包结构",
-            "  2. 下载中断（已开断点续传，重跑通常能过）",
-            "  3. makeappx 打包失败",
             "",
             "查看日志:",
             $runUrl,
