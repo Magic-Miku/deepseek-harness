@@ -6,12 +6,14 @@ permissions:
 jobs:
   build:
     runs-on: windows-2022
-    timeout-minutes: 60
+    timeout-minutes: 90
     defaults:
       run:
         shell: pwsh
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
       - name: Silent install
         id: inst
         run: |
@@ -26,7 +28,7 @@ jobs:
           $exe = Get-ChildItem $target -Recurse -Filter "DeepSeek Harness.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $exe) { throw "app exe not found" }
           $n = (Get-ChildItem $target -Recurse -File -ErrorAction SilentlyContinue).Count
-          Write-Host "appdir = $($exe.Directory.FullName)   files = $n"
+          Write-Host "appdir = $($exe.Directory.FullName)  files = $n"
           "appdir=$($exe.Directory.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
       - name: Write manifest and icons
         run: |
@@ -62,61 +64,91 @@ jobs:
           I 150 150 (Join-Path $a "Square150x150Logo.png")
           I 310 150 (Join-Path $a "Wide310x150Logo.png")
           Write-Host "manifest + icons done"
-      - name: Generate PackagingLayout.xml
-        run: |
-          $d = "${{ steps.inst.outputs.appdir }}"
-          $mf = Join-Path $d "AppxManifest.xml"
-          $L = @(
-          '<?xml version="1.0" encoding="utf-8"?>'
-          '<PackagingLayout xmlns="http://schemas.microsoft.com/appx/makeappx/2017">'
-          ('  <PackageFamily ID="BlueFish" ManifestPath="' + $mf + '" ResourceManager="false">')
-          '    <Package ID="x64" ProcessorArchitecture="x64">'
-          '      <Files>'
-          ('        <File DestinationPath="**" SourcePath="' + $d + '\**"/>')
-          ('        <File ExcludePath="' + $d + '\**\__pycache__\**"/>')
-          ('        <File ExcludePath="' + $d + '\**\*.pyc"/>')
-          ('        <File ExcludePath="' + $d + '\**\*.pyo"/>')
-          '      </Files>'
-          '    </Package>'
-          '  </PackageFamily>'
-          '</PackagingLayout>'
-          )
-          [System.IO.File]::WriteAllText("$env:GITHUB_WORKSPACE\PackagingLayout.xml", ($L -join "`r`n"), (New-Object System.Text.UTF8Encoding $false))
-          Write-Host "=== PackagingLayout.xml ==="
-          Get-Content "$env:GITHUB_WORKSPACE\PackagingLayout.xml"
-          Write-Host ""
-          Write-Host "=== 预计排除规模 ==="
-          $pc = Get-ChildItem $d -Directory -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq '__pycache__' }
-          $pcFiles = 0
-          foreach ($x in $pc) { $pcFiles += (Get-ChildItem $x.FullName -Recurse -File -ErrorAction SilentlyContinue).Count }
-          $total = (Get-ChildItem $d -Recurse -File -Force -ErrorAction SilentlyContinue).Count
-          Write-Host "  总文件数: $total"
-          Write-Host "  __pycache__ 下: $pcFiles"
-      - name: Try MakeAppx build
+      - name: Test multiple makeappx parameter combos
         continue-on-error: true
         run: |
+          $d = "${{ steps.inst.outputs.appdir }}"
           $mk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
-          New-Item -ItemType Directory -Force -Path "C:\outpkg" | Out-Null
-          $sw = [System.Diagnostics.Stopwatch]::StartNew()
-          & $mk build /f "$env:GITHUB_WORKSPACE\PackagingLayout.xml" /op "C:\outpkg" 2>&1 | Tee-Object b1.log
-          $code = $LASTEXITCODE
-          $sw.Stop()
-          Write-Host "EXIT=$code  elapsed=$([math]::Round($sw.Elapsed.TotalSeconds))s"
-          $f = Get-ChildItem "C:\outpkg" -Recurse -Include *.appx,*.msix -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($f) {
-            Write-Host ("*** SUCCESS " + $f.FullName + " {0:N1} MB ***" -f ($f.Length/1MB))
-            New-Item -ItemType Directory -Force -Path dist-msix | Out-Null
-            Copy-Item $f.FullName "dist-msix\bluefish.appx" -Force
-          } else {
-            Write-Host "*** FAILED ***"
+          New-Item -ItemType Directory -Force -Path "C:\out" | Out-Null
+          New-Item -ItemType Directory -Force -Path dist-msix | Out-Null
+          $summary = "s-summary.log"
+
+          # 参数组合列表
+          $combos = @(
+            @{ n = "A_default";      args = @("/d", $d, "/o") },
+            @{ n = "B_nc";           args = @("/d", $d, "/o", "/nc") },
+            @{ n = "C_nv";           args = @("/d", $d, "/o", "/nv") },
+            @{ n = "D_nc_nv";        args = @("/d", $d, "/o", "/nc", "/nv") },
+            @{ n = "E_nc_nv_sha256"; args = @("/d", $d, "/o", "/nc", "/nv", "/h", "SHA256") }
+          )
+
+          "=== 参数组合测试 ===" | Out-File $summary
+          "" | Out-File $summary -Append
+
+          foreach ($c in $combos) {
+            $out = "C:\out\$($c.n).appx"
+            $log = "b-$($c.n).log"
+            Remove-Item $out -Force -ErrorAction SilentlyContinue
+
+            Write-Host ""
+            Write-Host "=========================================="
+            Write-Host "测试: $($c.n)   参数: $($c.args -join ' ')"
+            Write-Host "=========================================="
+
+            $allArgs = $c.args + @("/p", $out)
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            & $mk pack @allArgs 2>&1 | Out-File $log
+            $code = $LASTEXITCODE
+            $sw.Stop()
+
+            $ok = (Test-Path $out)
+            $mb = if ($ok) { [math]::Round((Get-Item $out).Length/1MB,1) } else { 0 }
+            $elapsed = [math]::Round($sw.Elapsed.TotalSeconds)
+
+            Write-Host "  EXIT=$code  耗时=${elapsed}s  产物=$(if($ok){"$mb MB"}else{"无"})"
+
+            if ($ok) {
+              "$($c.n): SUCCESS  ${mb}MB  ${elapsed}s" | Out-File $summary -Append
+              Copy-Item $out "dist-msix\bluefish-$($c.n).appx" -Force
+            } else {
+              $err = (Get-Content $log -ErrorAction SilentlyContinue | Where-Object { $_ -match 'error' } | Select-Object -Last 1)
+              "$($c.n): FAILED   ${elapsed}s   $err" | Out-File $summary -Append
+            }
           }
-      - name: Show count
-        if: always()
+
+          "" | Out-File $summary -Append
+          "=== 汇总 ===" | Out-File $summary -Append
+          Get-Content $summary
+      - name: Also try winapp pack
+        continue-on-error: true
         run: |
-          $n = (Get-Content b1.log -ErrorAction SilentlyContinue | Where-Object { $_ -match 'as a payload file' }).Count
-          Write-Host "实际处理文件数 = $n"
-          Get-Content b1.log -ErrorAction SilentlyContinue |
-            Where-Object { $_ -match 'Enumerat|Building|error' } | Select-Object -First 8
+          $d = "${{ steps.inst.outputs.appdir }}"
+          New-Item -ItemType Directory -Force -Path "C:\outw" | Out-Null
+          winapp pack $d --no-sign --output "C:\outw\winapp.msix" 2>&1 | Tee-Object b-winapp.log
+          $f = Get-ChildItem "C:\outw" -Include *.msix,*.appx -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($f) {
+            Write-Host "*** WINAPP SUCCESS ***"
+            Copy-Item $f.FullName "dist-msix\bluefish-winapp.msix" -Force
+          } else {
+            Write-Host "winapp failed"
+          }
+      - name: Commit logs
+        if: always()
+        shell: bash
+        continue-on-error: true
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan diag-logs 2>/dev/null || git checkout diag-logs
+          git rm -r --cached . -q 2>/dev/null || true
+          find . -maxdepth 1 -name "*.log" -exec cp {} /tmp/ \; 2>/dev/null || true
+          ls -la /tmp/*.log 2>/dev/null || true
+          for f in s-summary.log b-A_default.log b-B_nc.log b-C_nv.log b-D_nc_nv.log b-E_nc_nv_sha256.log b-winapp.log; do
+            [ -f "$f" ] && cp "$f" . 2>/dev/null || true
+          done
+          git add -f *.log 2>/dev/null || true
+          git commit -m "logs run ${{ github.run_id }}" || echo "nothing"
+          git push -f origin diag-logs || echo "push failed"
       - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
@@ -130,6 +162,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: winapp-logs
-          path: b*.log
+          path: |
+            *.log
           if-no-files-found: warn
           retention-days: 14
