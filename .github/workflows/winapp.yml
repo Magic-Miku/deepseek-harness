@@ -17,16 +17,28 @@ jobs:
     outputs:
       changed: ${{ steps.c.outputs.changed }}
       hash: ${{ steps.c.outputs.hash }}
+      size: ${{ steps.c.outputs.size }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
       - id: c
         run: |
+          set -o pipefail
           U="https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe"
-          H=$(curl -sIL --max-time 60 "$U")
+          H=$(curl -sIL --max-time 60 --retry 3 "$U")
           LEN=$(echo "$H" | grep -i '^content-length:' | tail -1 | tr -d '\r' | awk '{print $2}')
           ETAG=$(echo "$H" | grep -i '^etag:' | tail -1 | tr -d '\r' | sed 's/^[Ee][Tt][Aa][Gg]: *//')
           LM=$(echo "$H" | grep -i '^last-modified:' | tail -1 | tr -d '\r' | cut -d' ' -f2-)
-          if [ -n "$ETAG" ]; then N="$LEN|$ETAG"; else N="$LEN|$LM"; fi
+          if [ -z "$LEN" ]; then
+            echo "::error::无法获取上游 content-length"
+            exit 1
+          fi
+          if [ -n "$ETAG" ]; then
+            N="$LEN|$ETAG"
+          else
+            N="$LEN|$LM"
+          fi
           O=""
           [ -f .dsh-hash ] && O=$(cat .dsh-hash | tr -d '\r\n')
           echo "current  = $N"
@@ -50,6 +62,7 @@ jobs:
           git add .dsh-heartbeat
           git diff --cached --quiet && echo "no change" && exit 0
           git commit -m "chore: heartbeat [skip ci]"
+          git pull --rebase --autostash origin master || echo "rebase failed"
           git push || echo "push failed"
       - name: Prune old artifacts
         if: always()
@@ -60,7 +73,7 @@ jobs:
         run: |
           KEEP=2
           echo "=== 当前 artifact ==="
-          gh api "repos/$REPO/actions/artifacts?per_page=100" --jq '.artifacts[] | "\(.id) \(.created_at) \(.name)"' | tee /tmp/arts.txt
+          gh api "repos/$REPO/actions/artifacts?per_page=100" --jq '.artifacts[] | "\(.id) \(.created_at) \(.name)"' > /tmp/arts.txt || true
           COUNT=$(wc -l < /tmp/arts.txt)
           echo "总数: $COUNT  (保留最新 $KEEP 个)"
           if [ "$COUNT" -le "$KEEP" ]; then echo "无需清理"; exit 0; fi
@@ -69,7 +82,7 @@ jobs:
             gh api -X DELETE "repos/$REPO/actions/artifacts/$ID" || true
           done
           echo "=== 清理后 ==="
-          gh api "repos/$REPO/actions/artifacts?per_page=100" --jq '"剩余 \(.total_count) 个"'
+          gh api "repos/$REPO/actions/artifacts?per_page=100" --jq '"剩余 \(.total_count) 个"' || true
   build:
     needs: [check]
     if: needs.check.outputs.changed == 'true'
@@ -80,30 +93,76 @@ jobs:
         shell: pwsh
     steps:
       - uses: actions/checkout@v4
-      - name: Install
+        with:
+          fetch-depth: 1
+      - name: Download upstream
         run: |
-          $f = "$env:RUNNER_TEMP\d.exe"
-          curl.exe -L --retry 5 --retry-delay 5 --retry-all-errors -C - --max-time 1800 -o $f "https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe"
+          $f = "$env:RUNNER_TEMP\dsh-setup.exe"
+          Remove-Item $f -Force -ErrorAction SilentlyContinue
+          curl.exe -L --retry 5 --retry-delay 5 --retry-all-errors --max-time 2400 -o $f "https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe"
+          if (-not (Test-Path $f)) { throw "download failed: file missing" }
           $sz = (Get-Item $f).Length
-          Write-Host "downloaded = $sz bytes (upstream ${{ needs.check.outputs.size }})"
+          $want = [int64]"${{ needs.check.outputs.size }}"
+          Write-Host "downloaded = $sz bytes (upstream $want)"
           if ($sz -lt 200MB) { throw "download too small: $sz" }
-          New-Item -ItemType Directory -Force -Path C:\A | Out-Null
-          Start-Process $f -ArgumentList "/S","/D=C:\A" -Wait
-          Start-Sleep 6
-          $e = Get-ChildItem C:\A -Recurse -Filter "DeepSeek Harness.exe" | Select-Object -First 1
-          if (-not $e) { throw "no exe" }
-          Write-Host "files = $((Get-ChildItem C:\A -Recurse -File -Force).Count)"
+          if ($sz -ne $want) { throw "size mismatch: got $sz, expected $want" }
+          Write-Host "download OK"
+      - name: Silent install
+        run: |
+          $f = "$env:RUNNER_TEMP\dsh-setup.exe"
+          $t = "C:\A"
+          if (Test-Path $t) { Remove-Item $t -Recurse -Force -ErrorAction SilentlyContinue }
+          New-Item -ItemType Directory -Force -Path $t | Out-Null
+          $p = Start-Process $f -ArgumentList "/S","/D=$t" -Wait -PassThru
+          Write-Host "installer exit = $($p.ExitCode)"
+          $deadline = (Get-Date).AddMinutes(8)
+          $exe = $null
+          $lastCount = -1
+          $stableRounds = 0
+          while ((Get-Date) -lt $deadline) {
+            $all = @(Get-ChildItem $t -Recurse -File -Force -ErrorAction SilentlyContinue)
+            $n = $all.Count
+            if (-not $exe) {
+              $exe = $all | Where-Object { $_.Name -eq "DeepSeek Harness.exe" } | Select-Object -First 1
+            }
+            if ($exe -and $n -eq $lastCount) {
+              $stableRounds++
+              if ($stableRounds -ge 3) {
+                Write-Host "文件数已稳定 ($n)，停止等待"
+                break
+              }
+            } else {
+              $stableRounds = 0
+            }
+            $lastCount = $n
+            Start-Sleep 5
+          }
+          $final = @(Get-ChildItem $t -Recurse -File -Force -ErrorAction SilentlyContinue)
+          Write-Host "files = $($final.Count)"
+          if (-not $exe) { throw "DeepSeek Harness.exe not found after install" }
+          if ($final.Count -lt 9000) { throw "too few files: $($final.Count) (expected ~9700)" }
+          Write-Host "install OK: $($exe.FullName)"
       - name: Pack
         id: pack
         run: |
           $d = "C:\A"
           $mk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
+          if (-not (Test-Path $mk)) {
+            $mk = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Filter makeappx.exe -Recurse -ErrorAction SilentlyContinue |
+                   Where-Object { $_.FullName -match "\\x64\\" } | Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          }
+          if (-not (Test-Path $mk)) { throw "makeappx not found" }
           $v = "1.0.$env:GITHUB_RUN_NUMBER.0"
           $s = "C:\S"
+          if (Test-Path $s) { Remove-Item $s -Recurse -Force -ErrorAction SilentlyContinue }
           New-Item -ItemType Directory -Force -Path $s | Out-Null
-          robocopy $d $s /E /NFL /NDL /NP /R:1 /W:1 | Out-Null
-          Get-ChildItem $s -Directory -Recurse -Force | Where-Object { $_.Name -eq "_rels" } | ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
-          Write-Host "staged = $((Get-ChildItem $s -Recurse -File -Force).Count)"
+          robocopy $d $s /E /NFL /NDL /NP /R:2 /W:2 | Out-Null
+          Get-ChildItem $s -Directory -Recurse -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -eq "_rels" } |
+            ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+          $staged = @(Get-ChildItem $s -Recurse -File -Force -ErrorAction SilentlyContinue)
+          Write-Host "staged = $($staged.Count)"
+          if ($staged.Count -lt 9000) { throw "staging incomplete: $($staged.Count)" }
           $a = "$s\Assets"
           New-Item -ItemType Directory -Force -Path $a | Out-Null
           $ic = "$env:GITHUB_WORKSPACE\.github\store-icons"
@@ -158,14 +217,17 @@ jobs:
             '</Package>'
           )
           [IO.File]::WriteAllText("$s\AppxManifest.xml", ($x -join "`n"), (New-Object Text.UTF8Encoding $false))
-          New-Item -ItemType Directory -Force -Path C:\out | Out-Null
-          & $mk pack /d $s /p C:\out\b.appx /o 2>&1 | Tee-Object b.log
-          if (-not (Test-Path C:\out\b.appx)) { Get-Content b.log | Select-Object -Last 5; throw "pack failed" }
-          $mb = [math]::Round((Get-Item C:\out\b.appx).Length/1MB,1)
+          $out = "C:\out"
+          if (Test-Path $out) { Remove-Item $out -Recurse -Force -ErrorAction SilentlyContinue }
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          & $mk pack /d $s /p "$out\b.appx" /o 2>&1 | Tee-Object b.log
+          if (-not (Test-Path "$out\b.appx")) { Get-Content b.log | Select-Object -Last 8; throw "pack failed" }
+          $mb = [math]::Round((Get-Item "$out\b.appx").Length/1MB,1)
           Write-Host "*** OK $mb MB ver=$v ***"
-          if ($mb -lt 100) { throw "too small" }
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item C:\out\b.appx dist\bluefish.appx -Force
+          if ($mb -lt 100) { throw "too small: $mb MB" }
+          if (Test-Path "dist") { Remove-Item "dist" -Recurse -Force -ErrorAction SilentlyContinue }
+          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+          Copy-Item "$out\b.appx" "dist\bluefish.appx" -Force
           "ver=$v" | Out-File -Append $env:GITHUB_OUTPUT
           "mb=$mb" | Out-File -Append $env:GITHUB_OUTPUT
       - uses: actions/upload-artifact@v4
@@ -186,7 +248,8 @@ jobs:
           git add .dsh-hash
           git diff --cached --quiet && echo "hash unchanged" && exit 0
           git commit -m "hash [skip ci]"
-          git push || true
+          git pull --rebase --autostash origin master || echo "rebase failed"
+          git push || echo "push failed"
       - name: Email success
         if: success()
         shell: pwsh
@@ -228,6 +291,12 @@ jobs:
             "",
             "版本: 1.0.${{ github.run_number }}.0",
             "上游指纹: ${{ needs.check.outputs.hash }}",
+            "",
+            "常见原因:",
+            "  1. DeepSeek 改了安装包结构（文件数/目录变化）",
+            "  2. 下载中断或大小不符（已加校验，重跑通常能过）",
+            "  3. 安装未完成（已加轮询等待）",
+            "  4. makeappx 打包失败",
             "",
             "查看日志:",
             $runUrl,
