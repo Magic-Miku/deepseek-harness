@@ -72,10 +72,10 @@ jobs:
           ('  <PackageFamily ID="BlueFish" ManifestPath="' + $mf + '" ResourceManager="false">')
           '    <Package ID="x64" ProcessorArchitecture="x64">'
           '      <Files>'
-          ('        <File DestinationPath="**" SourcePath="' + $d + '\**" ExcludePath="**\__pycache__\**" />')
-          ('        <File DestinationPath="**" SourcePath="' + $d + '\**" ExcludePath="**\*.pyc" />')
-          ('        <File DestinationPath="**" SourcePath="' + $d + '\**" ExcludePath="**\*.pyo" />')
-          ('        <File DestinationPath="**" SourcePath="' + $d + '\**" ExcludePath="**\*.pdb" />')
+          ('        <File DestinationPath="**" SourcePath="' + $d + '\**"/>')
+          ('        <File ExcludePath="' + $d + '\**\__pycache__\**"/>')
+          ('        <File ExcludePath="' + $d + '\**\*.pyc"/>')
+          ('        <File ExcludePath="' + $d + '\**\*.pyo"/>')
           '      </Files>'
           '    </Package>'
           '  </PackageFamily>'
@@ -89,13 +89,10 @@ jobs:
           $pc = Get-ChildItem $d -Directory -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq '__pycache__' }
           $pcFiles = 0
           foreach ($x in $pc) { $pcFiles += (Get-ChildItem $x.FullName -Recurse -File -ErrorAction SilentlyContinue).Count }
-          $ext = (Get-ChildItem $d -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in @('.pyc','.pyo','.pdb') }).Count
           $total = (Get-ChildItem $d -Recurse -File -Force -ErrorAction SilentlyContinue).Count
-          Write-Host "  总文件数:        $total"
-          Write-Host "  __pycache__ 下:  $pcFiles"
-          Write-Host "  .pyc/.pyo/.pdb:  $ext"
+          Write-Host "  总文件数: $total"
+          Write-Host "  __pycache__ 下: $pcFiles"
       - name: Try MakeAppx build
-        id: build1
         continue-on-error: true
         run: |
           $mk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
@@ -113,16 +110,13 @@ jobs:
           } else {
             Write-Host "*** FAILED ***"
           }
-      - name: Show file count in log
+      - name: Show count
         if: always()
         run: |
-          Write-Host "=== 日志中的关键行 ==="
-          Get-Content b1.log -ErrorAction SilentlyContinue |
-            Where-Object { $_ -match 'Enumerat|Pack|Building package|error|Ignoring' } |
-            Select-Object -First 12
-          Write-Host ""
           $n = (Get-Content b1.log -ErrorAction SilentlyContinue | Where-Object { $_ -match 'as a payload file' }).Count
           Write-Host "实际处理文件数 = $n"
+          Get-Content b1.log -ErrorAction SilentlyContinue |
+            Where-Object { $_ -match 'Enumerat|Building|error' } | Select-Object -First 8
       - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
