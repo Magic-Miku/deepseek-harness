@@ -45,7 +45,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install
-        id: i
         run: |
           $f = "$env:RUNNER_TEMP\d.exe"
           curl.exe -L --retry 3 --max-time 1800 -o $f "https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe"
@@ -101,7 +100,7 @@ jobs:
         with:
           name: dsh-msix
           path: dist/*
-          retention-days: 30
+          retention-days: 90
       - name: Save hash
         if: success()
         shell: bash
@@ -113,6 +112,37 @@ jobs:
           git add .dsh-hash
           git commit -m "hash [skip ci]" || true
           git push || true
+      - name: Send email
+        if: success()
+        shell: pwsh
+        run: |
+          $runUrl = "https://github.com/Magic-Miku/deepseek-harness/actions/runs/${{ github.run_id }}"
+          $L = @(
+            "DeepSeek Harness 官方更新了，新包已构建完成。",
+            "",
+            "版本: 1.0.${{ github.run_number }}.0",
+            "大小: 约 382 MB（完整包）",
+            "",
+            "===== 下载 =====",
+            "1. 打开下面链接",
+            "2. 拉到页面最底部",
+            "3. 点 Artifacts 里的 dsh-msix 下载",
+            "",
+            $runUrl,
+            "",
+            "===== 上传商店 =====",
+            "1. 打开 https://partner.microsoft.com/dashboard/apps-and-games",
+            "2. 点蓝色大肥鱼 -> 更新",
+            "3. 上传解压出的 bluefish.appx",
+            "4. 提交认证（约 3 个工作日）",
+            "",
+            "-- GitHub Actions 自动发送"
+          )
+          $body = $L -join "`r`n"
+          $sec = ConvertTo-SecureString "${{ secrets.QQ_AUTH_CODE }}" -AsPlainText -Force
+          $cred = New-Object System.Management.Automation.PSCredential("${{ secrets.QQ_EMAIL }}", $sec)
+          Send-MailMessage -SmtpServer "smtp.qq.com" -Port 587 -UseSsl -From "${{ secrets.QQ_EMAIL }}" -To "${{ secrets.QQ_EMAIL }}" -Subject "[DSH] 新版本已就绪，可以发布到商店了" -Body $body -Encoding UTF8 -Credential $cred
+          Write-Host "邮件已发送"
   publish:
     needs: [build]
     if: needs.build.result == 'success'
@@ -125,7 +155,7 @@ jobs:
           if ("${{ secrets.STORE_PRODUCT_ID }}" -ne "") {
             "ok=true" | Out-File -Append $env:GITHUB_OUTPUT
           } else {
-            Write-Host "未配置 Secrets，跳过发布"
+            Write-Host "未配置 Store Secrets，跳过自动发布"
             "ok=false" | Out-File -Append $env:GITHUB_OUTPUT
           }
       - uses: actions/checkout@v4
