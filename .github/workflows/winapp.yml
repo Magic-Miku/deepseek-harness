@@ -6,7 +6,7 @@ permissions:
 jobs:
   build:
     runs-on: windows-2025
-    timeout-minutes: 90
+    timeout-minutes: 120
     defaults:
       run:
         shell: pwsh
@@ -14,16 +14,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
-      - name: Check runner specs
-        run: |
-          Write-Host "=== Runner 环境 ==="
-          Write-Host "OS: $((Get-CimInstance Win32_OperatingSystem).Caption)"
-          Write-Host "Version: $((Get-CimInstance Win32_OperatingSystem).Version)"
-          $cs = Get-CimInstance Win32_ComputerSystem
-          Write-Host ("CPU cores: " + $cs.NumberOfLogicalProcessors)
-          Write-Host ("RAM: {0:N1} GB" -f ($cs.TotalPhysicalMemory/1GB))
-          Write-Host ("Free disk C: {0:N1} GB" -f ((Get-PSDrive C).Free/1GB))
-          Write-Host "Runner image: $env:ImageOS / $env:ImageVersion"
       - name: Silent install
         id: inst
         run: |
@@ -33,14 +23,14 @@ jobs:
           $target = "C:\DSHApp"
           New-Item -ItemType Directory -Force -Path $target | Out-Null
           $p = Start-Process -FilePath $tmp -ArgumentList "/S", "/D=$target" -Wait -PassThru
-          Write-Host "installer exit = $($p.ExitCode)"
           Start-Sleep -Seconds 6
           $exe = Get-ChildItem $target -Recurse -Filter "DeepSeek Harness.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $exe) { throw "app exe not found" }
           $n = (Get-ChildItem $target -Recurse -File -ErrorAction SilentlyContinue).Count
           Write-Host "appdir = $($exe.Directory.FullName)  files = $n"
           "appdir=$($exe.Directory.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
-      - name: Write manifest and icons
+      - name: Prepare manifest template
+        id: mf
         run: |
           $d = "${{ steps.inst.outputs.appdir }}"
           $v = "1.0.$env:GITHUB_RUN_NUMBER.0"
@@ -57,49 +47,94 @@ jobs:
           '  </Application></Applications>'
           '</Package>'
           )
-          [System.IO.File]::WriteAllText((Join-Path $d "AppxManifest.xml"), ($L -join "`r`n"), (New-Object System.Text.UTF8Encoding $false))
-          $a = Join-Path $d "Assets"
-          New-Item -ItemType Directory -Force -Path $a | Out-Null
-          Add-Type -AssemblyName System.Drawing
-          function I($w,$h,$o) {
-            $b = New-Object System.Drawing.Bitmap $w,$h
-            $g = [System.Drawing.Graphics]::FromImage($b)
-            $g.Clear([System.Drawing.Color]::FromArgb(58,95,170))
-            $b.Save($o, [System.Drawing.Imaging.ImageFormat]::Png)
-            $g.Dispose(); $b.Dispose()
-          }
-          I 50 50 (Join-Path $a "StoreLogo.png")
-          I 44 44 (Join-Path $a "Square44x44Logo.png")
-          I 150 150 (Join-Path $a "Square150x150Logo.png")
-          I 310 150 (Join-Path $a "Wide310x150Logo.png")
-          Write-Host "manifest + icons done"
-      - name: MakeAppx full package
+          [System.IO.File]::WriteAllText("$env:GITHUB_WORKSPACE\manifest-template.xml", ($L -join "`r`n"), (New-Object System.Text.UTF8Encoding $false))
+          Write-Host "version = $v"
+          Write-Host "manifest template ready"
+      - name: Threshold scan - 4000 / 4500 / 4900 / 5100
         continue-on-error: true
         run: |
-          $d = "${{ steps.inst.outputs.appdir }}"
+          $src = "${{ steps.inst.outputs.appdir }}"
           $mk = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Filter makeappx.exe -Recurse -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -match "\\x64\\" } | Sort-Object FullName -Descending | Select-Object -First 1
           Write-Host "makeappx = $($mk.FullName)"
           New-Item -ItemType Directory -Force -Path "C:\out" | Out-Null
+
+          # 收集所有文件（不包含 manifest，稍后单独加）
+          Write-Host "枚举文件..."
+          $allFiles = Get-ChildItem $src -Recurse -File -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne "AppxManifest.xml" }
+          $total = $allFiles.Count
+          Write-Host "总文件数 = $total"
+
+          # 排序保证确定性
+          $allFiles = $allFiles | Sort-Object FullName
+
           New-Item -ItemType Directory -Force -Path dist-msix | Out-Null
-          $sw = [System.Diagnostics.Stopwatch]::StartNew()
-          & $mk.FullName pack /d $d /p "C:\out\full.appx" /o 2>&1 | Tee-Object b1.log
-          $code = $LASTEXITCODE
-          $sw.Stop()
-          Write-Host "EXIT=$code  elapsed=$([math]::Round($sw.Elapsed.TotalSeconds))s"
-          $f = Get-ChildItem "C:\out" -Include *.appx -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($f) {
-            $mb = [math]::Round($f.Length/1MB,1)
-            Write-Host "*** SUCCESS $mb MB ***"
-            Copy-Item $f.FullName "dist-msix\bluefish.appx" -Force
-            "RESULT=SUCCESS size=${mb}MB elapsed=$([math]::Round($sw.Elapsed.TotalSeconds))s" | Out-File s-result.log
-          } else {
-            $n = (Get-Content b1.log -ErrorAction SilentlyContinue | Where-Object { $_ -match 'as a payload file' }).Count
-            Write-Host "*** FAILED  processed=$n ***"
-            Get-Content b1.log -ErrorAction SilentlyContinue | Select-Object -Last 3
-            "RESULT=FAILED processed=$n elapsed=$([math]::Round($sw.Elapsed.TotalSeconds))s" | Out-File s-result.log
+          $summary = "s-scan.log"
+          "=== 阈值扫描 ===" | Out-File $summary
+          "总文件数: $total" | Out-File $summary -Append
+          "" | Out-File $summary -Append
+
+          foreach ($limit in @(4000, 4500, 4900, 5100)) {
+            if ($limit -gt $total) { continue }
+            $stage = "C:\S$limit"
+            if (Test-Path $stage) { Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue }
+            New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+            # 复制前 N 个文件，保持相对路径
+            $take = $allFiles | Select-Object -First $limit
+            foreach ($f in $take) {
+              $rel = $f.FullName.Substring($src.Length).TrimStart('\')
+              $tgt = Join-Path $stage $rel
+              $td = [System.IO.Path]::GetDirectoryName($tgt)
+              if (-not (Test-Path $td)) { New-Item -ItemType Directory -Force -Path $td | Out-Null }
+              Copy-Item $f.FullName $tgt -Force -ErrorAction SilentlyContinue
+            }
+            # 加 manifest 和图标
+            Copy-Item "$env:GITHUB_WORKSPACE\manifest-template.xml" (Join-Path $stage "AppxManifest.xml") -Force
+            $assetsSrc = Join-Path $src "Assets"
+            $assetsDst = Join-Path $stage "Assets"
+            New-Item -ItemType Directory -Force -Path $assetsDst | Out-Null
+            if (Test-Path $assetsSrc) {
+              Get-ChildItem $assetsSrc -File -ErrorAction SilentlyContinue | ForEach-Object {
+                Copy-Item $_.FullName (Join-Path $assetsDst $_.Name) -Force -ErrorAction SilentlyContinue
+              }
+            }
+            $realCount = (Get-ChildItem $stage -Recurse -File -Force -ErrorAction SilentlyContinue).Count
+
+            Write-Host ""
+            Write-Host "=========================================="
+            Write-Host "测试 $limit （实际 $realCount 个文件）"
+            Write-Host "=========================================="
+
+            $outPkg = "C:\out\l$limit.appx"
+            Remove-Item $outPkg -Force -ErrorAction SilentlyContinue
+            $log = "b-$limit.log"
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            & $mk.FullName pack /d $stage /p $outPkg /o 2>&1 | Out-File $log
+            $code = $LASTEXITCODE
+            $sw.Stop()
+            $el = [math]::Round($sw.Elapsed.TotalSeconds)
+            $processed = (Get-Content $log -ErrorAction SilentlyContinue | Where-Object { $_ -match 'as a payload file' }).Count
+            $ok = (Test-Path $outPkg)
+
+            if ($ok) {
+              $mb = [math]::Round((Get-Item $outPkg).Length/1MB,1)
+              Write-Host "  *** 成功 $mb MB  (${el}s) ***"
+              "$limit : SUCCESS  ${mb}MB  processed=$processed  ${el}s" | Out-File $summary -Append
+              Copy-Item $outPkg "dist-msix\bluefish-l$limit.appx" -Force
+            } else {
+              $err = (Get-Content $log -ErrorAction SilentlyContinue | Where-Object { $_ -match 'error' } | Select-Object -Last 1)
+              Write-Host "  *** 失败 processed=$processed (${el}s) ***"
+              "$limit : FAILED   processed=$processed  ${el}s" | Out-File $summary -Append
+            }
+            # 清理暂存盘
+            Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
           }
-          Get-Content s-result.log
+
+          "" | Out-File $summary -Append
+          "=== 汇总 ===" | Out-File $summary -Append
+          Get-Content $summary
       - name: Commit logs
         if: always()
         shell: bash
@@ -109,7 +144,9 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout --orphan diag-logs 2>/dev/null || git checkout diag-logs
           git rm -r --cached . -q 2>/dev/null || true
-          for f in s-result.log b1.log; do [ -f "$f" ] && cp "$f" . 2>/dev/null || true; done
+          for f in s-scan.log b-4000.log b-4500.log b-4900.log b-5100.log; do
+            [ -f "$f" ] && cp "$f" . 2>/dev/null || true
+          done
           git add -f *.log 2>/dev/null || true
           git commit -m "logs run ${{ github.run_id }}" || echo "nothing"
           git push -f origin diag-logs || echo "push failed"
