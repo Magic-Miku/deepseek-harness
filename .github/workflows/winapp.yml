@@ -5,7 +5,7 @@ permissions:
   contents: write
 jobs:
   build:
-    runs-on: windows-2022
+    runs-on: windows-2025
     timeout-minutes: 90
     defaults:
       run:
@@ -14,6 +14,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
+      - name: Check runner specs
+        run: |
+          Write-Host "=== Runner 环境 ==="
+          Write-Host "OS: $((Get-CimInstance Win32_OperatingSystem).Caption)"
+          Write-Host "Version: $((Get-CimInstance Win32_OperatingSystem).Version)"
+          $cs = Get-CimInstance Win32_ComputerSystem
+          Write-Host ("CPU cores: " + $cs.NumberOfLogicalProcessors)
+          Write-Host ("RAM: {0:N1} GB" -f ($cs.TotalPhysicalMemory/1GB))
+          Write-Host ("Free disk C: {0:N1} GB" -f ((Get-PSDrive C).Free/1GB))
+          Write-Host "Runner image: $env:ImageOS / $env:ImageVersion"
       - name: Silent install
         id: inst
         run: |
@@ -30,42 +40,10 @@ jobs:
           $n = (Get-ChildItem $target -Recurse -File -ErrorAction SilentlyContinue).Count
           Write-Host "appdir = $($exe.Directory.FullName)  files = $n"
           "appdir=$($exe.Directory.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
-      - name: Stage with robocopy
-        id: stage
-        run: |
-          $src = "${{ steps.inst.outputs.appdir }}"
-          $dst = "C:\Staged"
-          if (Test-Path $dst) { Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue }
-          New-Item -ItemType Directory -Force -Path $dst | Out-Null
-
-          $log = "s-stage.log"
-          "=== robocopy 复制（排除缓存/测试/文档）===" | Out-File $log
-          "" | Out-File $log -Append
-
-          $args = @(
-            $src, $dst, "/E", "/NFL", "/NDL", "/NP", "/R:1", "/W:1",
-            "/XD", "__pycache__", "tests", "test", "docs", "doc", "examples", "example", "demos",
-            "/XF", "*.pyc", "*.pyo", "*.pyi", "*.pdb", "*.patch", "*.diff"
-          )
-          & robocopy @args 2>&1 | Out-File $log -Append
-          "robocopy exit = $LASTEXITCODE" | Out-File $log -Append
-          "" | Out-File $log -Append
-
-          $origN = (Get-ChildItem $src -Recurse -File -Force -ErrorAction SilentlyContinue).Count
-          $newN  = (Get-ChildItem $dst -Recurse -File -Force -ErrorAction SilentlyContinue).Count
-          $newMB = [math]::Round((Get-ChildItem $dst -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum/1MB, 1)
-          "原始文件数: $origN" | Out-File $log -Append
-          "精简后文件数: $newN" | Out-File $log -Append
-          "精简后大小: $newMB MB" | Out-File $log -Append
-          Get-Content $log
-          "staged=$dst" | Out-File -Append $env:GITHUB_OUTPUT
-      - name: Copy manifest and icons to staged
+      - name: Write manifest and icons
         run: |
           $d = "${{ steps.inst.outputs.appdir }}"
-          $st = "${{ steps.stage.outputs.staged }}"
-          Copy-Item (Join-Path $d "AppxManifest.xml") $st -Force -ErrorAction SilentlyContinue
           $v = "1.0.$env:GITHUB_RUN_NUMBER.0"
-          # 重新生成 manifest（带正确版本号）
           $L = @(
           '<?xml version="1.0" encoding="utf-8"?>'
           '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap rescap">'
@@ -79,8 +57,8 @@ jobs:
           '  </Application></Applications>'
           '</Package>'
           )
-          [System.IO.File]::WriteAllText((Join-Path $st "AppxManifest.xml"), ($L -join "`r`n"), (New-Object System.Text.UTF8Encoding $false))
-          $a = Join-Path $st "Assets"
+          [System.IO.File]::WriteAllText((Join-Path $d "AppxManifest.xml"), ($L -join "`r`n"), (New-Object System.Text.UTF8Encoding $false))
+          $a = Join-Path $d "Assets"
           New-Item -ItemType Directory -Force -Path $a | Out-Null
           Add-Type -AssemblyName System.Drawing
           function I($w,$h,$o) {
@@ -94,31 +72,34 @@ jobs:
           I 44 44 (Join-Path $a "Square44x44Logo.png")
           I 150 150 (Join-Path $a "Square150x150Logo.png")
           I 310 150 (Join-Path $a "Wide310x150Logo.png")
-          Write-Host "manifest + icons -> staged"
-      - name: MakeAppx on staged
+          Write-Host "manifest + icons done"
+      - name: MakeAppx full package
         continue-on-error: true
         run: |
-          $st = "${{ steps.stage.outputs.staged }}"
-          $mk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
+          $d = "${{ steps.inst.outputs.appdir }}"
+          $mk = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Filter makeappx.exe -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "\\x64\\" } | Sort-Object FullName -Descending | Select-Object -First 1
+          Write-Host "makeappx = $($mk.FullName)"
           New-Item -ItemType Directory -Force -Path "C:\out" | Out-Null
           New-Item -ItemType Directory -Force -Path dist-msix | Out-Null
           $sw = [System.Diagnostics.Stopwatch]::StartNew()
-          & $mk pack /d $st /p "C:\out\staged.appx" /o 2>&1 | Tee-Object b1.log
+          & $mk.FullName pack /d $d /p "C:\out\full.appx" /o 2>&1 | Tee-Object b1.log
           $code = $LASTEXITCODE
           $sw.Stop()
           Write-Host "EXIT=$code  elapsed=$([math]::Round($sw.Elapsed.TotalSeconds))s"
           $f = Get-ChildItem "C:\out" -Include *.appx -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($f) {
-            Write-Host ("*** SUCCESS " + $f.FullName + " {0:N1} MB ***" -f ($f.Length/1MB))
-            Copy-Item $f.FullName "dist-msix\bluefish-staged.appx" -Force
-            "RESULT=SUCCESS" | Out-File s-result.log
+            $mb = [math]::Round($f.Length/1MB,1)
+            Write-Host "*** SUCCESS $mb MB ***"
+            Copy-Item $f.FullName "dist-msix\bluefish.appx" -Force
+            "RESULT=SUCCESS size=${mb}MB elapsed=$([math]::Round($sw.Elapsed.TotalSeconds))s" | Out-File s-result.log
           } else {
-            Write-Host "*** FAILED ***"
             $n = (Get-Content b1.log -ErrorAction SilentlyContinue | Where-Object { $_ -match 'as a payload file' }).Count
-            Write-Host "处理文件数 = $n"
+            Write-Host "*** FAILED  processed=$n ***"
             Get-Content b1.log -ErrorAction SilentlyContinue | Select-Object -Last 3
-            "RESULT=FAILED processed=$n" | Out-File s-result.log
+            "RESULT=FAILED processed=$n elapsed=$([math]::Round($sw.Elapsed.TotalSeconds))s" | Out-File s-result.log
           }
+          Get-Content s-result.log
       - name: Commit logs
         if: always()
         shell: bash
@@ -128,7 +109,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout --orphan diag-logs 2>/dev/null || git checkout diag-logs
           git rm -r --cached . -q 2>/dev/null || true
-          for f in s-stage.log s-result.log b1.log; do [ -f "$f" ] && cp "$f" . 2>/dev/null || true; done
+          for f in s-result.log b1.log; do [ -f "$f" ] && cp "$f" . 2>/dev/null || true; done
           git add -f *.log 2>/dev/null || true
           git commit -m "logs run ${{ github.run_id }}" || echo "nothing"
           git push -f origin diag-logs || echo "push failed"
