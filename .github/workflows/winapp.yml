@@ -65,14 +65,21 @@ jobs:
           robocopy $d $s /E /NFL /NDL /NP /R:1 /W:1 | Out-Null
           Get-ChildItem $s -Directory -Recurse -Force | Where-Object { $_.Name -eq "_rels" } | ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
           Write-Host "staged = $((Get-ChildItem $s -Recurse -File -Force).Count)"
+          # 只放 3 个必需图标
+          $a = "$s\Assets"
+          New-Item -ItemType Directory -Force -Path $a | Out-Null
+          $ic = "$env:GITHUB_WORKSPACE\.github\store-icons"
+          Copy-Item "$ic\StoreLogo.png" "$a\StoreLogo.png" -Force
+          Copy-Item "$ic\Square150x150Logo.png" "$a\Square150x150Logo.png" -Force
+          Copy-Item "$ic\Square44x44Logo.png" "$a\Square44x44Logo.png" -Force
+          Get-ChildItem $a | ForEach-Object { Write-Host ("  " + $_.Name + "  " + $_.Length) }
           $x = @(
             '<?xml version="1.0" encoding="utf-8"?>'
-            '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap rescap" xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest">'
+            '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap rescap">'
             ('  <Identity Name="14714BE0.320850A8A419A" Publisher="CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" Version="' + $v + '" />')
             '  <Properties>'
             '    <DisplayName>BlueFish</DisplayName>'
             '    <PublisherDisplayName>Miku</PublisherDisplayName>'
-            '    <Description>BlueFish - Electron desktop shell for a bundled dsh runtime and external plugins</Description>'
             '    <Logo>Assets\StoreLogo.png</Logo>'
             '  </Properties>'
             '  <Dependencies>'
@@ -84,40 +91,16 @@ jobs:
             '  </Resources>'
             '  <Applications>'
             '    <Application Id="App" Executable="DeepSeek Harness.exe" EntryPoint="Windows.FullTrustApplication">'
-            '      <uap:VisualElements DisplayName="BlueFish" Description="BlueFish - A powerful AI development environment" BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png">'
-            '        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" Square310x310Logo="Assets\Square310x310Logo.png" Square71x71Logo="Assets\Square71x71Logo.png">'
-            '          <uap:ShowNameOnTiles>'
-            '            <uap:ShowOn Tile="square150x150Logo" />'
-            '            <uap:ShowOn Tile="wide310x150Logo" />'
-            '            <uap:ShowOn Tile="square310x310Logo" />'
-            '          </uap:ShowNameOnTiles>'
-            '        </uap:DefaultTile>'
-            '        <uap:SplashScreen Image="Assets\SplashScreen.png" />'
-            '        <uap:LockScreen BadgeLogo="Assets\BadgeLogo.png" Notification="badgeAndTileText" />'
-            '      </uap:VisualElements>'
+            '      <uap:VisualElements DisplayName="BlueFish" Description="BlueFish" BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png" />'
             '    </Application>'
             '  </Applications>'
             '  <Capabilities>'
             '    <Capability Name="internetClient" />'
-            '    <Capability Name="internetClientServer" />'
-            '    <Capability Name="privateNetworkClientServer" />'
             '    <rescap:Capability Name="runFullTrust" />'
             '  </Capabilities>'
-            '  <mp:PhoneIdentity PhoneProductId="49e5ab4f-088e-46fc-bf22-b748a9999b08" PhonePublisherId="1bf42279-ce31-40ab-8b3e-fcd19d939971" />'
             '</Package>'
           )
           [IO.File]::WriteAllText("$s\AppxManifest.xml", ($x -join "`n"), (New-Object Text.UTF8Encoding $false))
-          $a = "$s\Assets"
-          New-Item -ItemType Directory -Force -Path $a | Out-Null
-          $src = "$env:GITHUB_WORKSPACE\.github\store-icons"
-          $want = @("AppList.png","BadgeLogo.png","LargeTile.png","MediumTile.png","SmallTile.png","SplashScreen.png","Square150x150Logo.png","Square310x310Logo.png","Square44x44Logo.png","Square71x71Logo.png","StoreLogo.png","Wide310x150Logo.png","WideTile.png")
-          $ok = 0
-          foreach ($n in $want) {
-            $p = Join-Path $src $n
-            if (Test-Path $p) { Copy-Item $p (Join-Path $a $n) -Force; $ok++ } else { Write-Host "  missing: $n" }
-          }
-          Write-Host "icons copied = $ok / $($want.Count)"
-          if ($ok -lt 13) { throw "icons incomplete: $ok" }
           New-Item -ItemType Directory -Force -Path C:\out | Out-Null
           & $mk pack /d $s /p C:\out\b.appx /o 2>&1 | Tee-Object b.log
           if (-not (Test-Path C:\out\b.appx)) { Get-Content b.log | Select-Object -Last 5; throw "pack failed" }
@@ -151,25 +134,15 @@ jobs:
             "DeepSeek Harness 官方更新了，新包已构建完成。",
             "",
             "版本: 1.0.${{ github.run_number }}.0",
-            "大小: 约 382 MB（完整包）",
+            "大小: 约 382 MB",
             "",
-            "===== 下载 =====",
-            "1. 打开下面链接",
-            "2. 拉到页面最底部",
-            "3. 点 Artifacts 里的 dsh-msix 下载",
+            "下载: " + $runUrl,
             "",
-            $runUrl,
-            "",
-            "===== 上传商店 =====",
-            "1. 打开 https://partner.microsoft.com/dashboard/apps-and-games",
-            "2. 点蓝色大肥鱼 -> 更新",
-            "3. 上传解压出的 bluefish.appx",
-            "4. 提交认证（约 3 个工作日）",
-            "",
-            "-- GitHub Actions 自动发送"
+            "上传商店: https://partner.microsoft.com/dashboard/apps-and-games",
+            "点蓝色大肥鱼 -> 更新 -> 上传 bluefish.appx"
           )
           $body = $L -join "`r`n"
           $sec = ConvertTo-SecureString "${{ secrets.QQ_AUTH_CODE }}" -AsPlainText -Force
           $cred = New-Object System.Management.Automation.PSCredential("${{ secrets.QQ_EMAIL }}", $sec)
-          Send-MailMessage -SmtpServer "smtp.qq.com" -Port 587 -UseSsl -From "${{ secrets.QQ_EMAIL }}" -To "${{ secrets.QQ_EMAIL }}" -Subject "[DSH] 新版本已就绪，可以发布到商店了" -Body $body -Encoding UTF8 -Credential $cred
-          Write-Host "邮件已发送"
+          Send-MailMessage -SmtpServer "smtp.qq.com" -Port 587 -UseSsl -From "${{ secrets.QQ_EMAIL }}" -To "${{ secrets.QQ_EMAIL }}" -Subject "[DSH] 新版本已就绪" -Body $body -Encoding UTF8 -Credential $cred
+          Write-Host "mail sent"
