@@ -78,16 +78,20 @@ jobs:
             '</Application></Applications></Package>'
           )
           [IO.File]::WriteAllText("$s\AppxManifest.xml", ($x -join "`n"), (New-Object Text.UTF8Encoding $false))
+          # 图标：从仓库读取（不再用纯色方块）
           $a = "$s\Assets"
           New-Item -ItemType Directory -Force -Path $a | Out-Null
-          Add-Type -AssemblyName System.Drawing
-          50,44,150 | ForEach-Object { $b = New-Object Drawing.Bitmap $_,$_; $g=[Drawing.Graphics]::FromImage($b); $g.Clear([Drawing.Color]::FromArgb(58,95,170)); $b.Save("$a\L$_.png",[Drawing.Imaging.ImageFormat]::Png); $g.Dispose(); $b.Dispose() }
-          Copy-Item "$a\L50.png" "$a\StoreLogo.png" -Force
-          Copy-Item "$a\L44.png" "$a\Square44x44Logo.png" -Force
-          Copy-Item "$a\L150.png" "$a\Square150x150Logo.png" -Force
-          $b = New-Object Drawing.Bitmap 310,150
-          $g = [Drawing.Graphics]::FromImage($b); $g.Clear([Drawing.Color]::FromArgb(58,95,170))
-          $b.Save("$a\Wide310x150Logo.png",[Drawing.Imaging.ImageFormat]::Png); $g.Dispose(); $b.Dispose()
+          $src = "$env:GITHUB_WORKSPACE\.github\store-icons"
+          $want = @("StoreLogo.png","Square44x44Logo.png","Square71x71Logo.png","Square150x150Logo.png","Square310x310Logo.png","Wide310x150Logo.png","SplashScreen.png","BadgeLogo.png")
+          $ok = 0
+          foreach ($n in $want) {
+            $p = Join-Path $src $n
+            if (Test-Path $p) { Copy-Item $p (Join-Path $a $n) -Force; $ok++ }
+            else { Write-Host "  missing: $n" }
+          }
+          Write-Host "icons copied = $ok / $($want.Count)"
+          if ($ok -lt 4) { throw "too few icons" }
+          Get-ChildItem $a | ForEach-Object { Write-Host ("  " + $_.Name + "  " + $_.Length + " B") }
           New-Item -ItemType Directory -Force -Path C:\out | Out-Null
           & $mk pack /d $s /p C:\out\b.appx /o 2>&1 | Tee-Object b.log
           if (-not (Test-Path C:\out\b.appx)) { Get-Content b.log | Select-Object -Last 5; throw "pack failed" }
@@ -143,42 +147,3 @@ jobs:
           $cred = New-Object System.Management.Automation.PSCredential("${{ secrets.QQ_EMAIL }}", $sec)
           Send-MailMessage -SmtpServer "smtp.qq.com" -Port 587 -UseSsl -From "${{ secrets.QQ_EMAIL }}" -To "${{ secrets.QQ_EMAIL }}" -Subject "[DSH] 新版本已就绪，可以发布到商店了" -Body $body -Encoding UTF8 -Credential $cred
           Write-Host "邮件已发送"
-  publish:
-    needs: [build]
-    if: needs.build.result == 'success'
-    runs-on: windows-latest
-    steps:
-      - name: Check secrets
-        id: s
-        shell: pwsh
-        run: |
-          if ("${{ secrets.STORE_PRODUCT_ID }}" -ne "") {
-            "ok=true" | Out-File -Append $env:GITHUB_OUTPUT
-          } else {
-            Write-Host "未配置 Store Secrets，跳过自动发布"
-            "ok=false" | Out-File -Append $env:GITHUB_OUTPUT
-          }
-      - uses: actions/checkout@v4
-        if: steps.s.outputs.ok == 'true'
-      - uses: microsoft/microsoft-store-apppublisher@v1.1
-        if: steps.s.outputs.ok == 'true'
-      - name: Configure
-        if: steps.s.outputs.ok == 'true'
-        run: |
-          msstore reconfigure `
-            --tenantId ${{ secrets.AZURE_AD_TENANT_ID }} `
-            --sellerId ${{ secrets.SELLER_ID }} `
-            --clientId ${{ secrets.AZURE_AD_APPLICATION_CLIENT_ID }} `
-            --clientSecret ${{ secrets.AZURE_AD_APPLICATION_SECRET }}
-      - uses: actions/download-artifact@v4
-        if: steps.s.outputs.ok == 'true'
-        with:
-          name: dsh-msix
-          path: ./r
-      - name: Publish
-        if: steps.s.outputs.ok == 'true'
-        shell: pwsh
-        run: |
-          $p = Get-ChildItem ./r -Include *.appx,*.msix -Recurse | Select-Object -First 1
-          Write-Host "publishing $($p.FullName)"
-          msstore publish "$($p.FullName)" -id ${{ secrets.STORE_PRODUCT_ID }} --packageRolloutPercentage 5
