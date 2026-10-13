@@ -25,17 +25,15 @@ jobs:
           $exe = Get-ChildItem $t -Recurse -Filter "DeepSeek Harness.exe" | Select-Object -First 1
           if (-not $exe) { throw "no exe" }
           "appdir=$($exe.Directory.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
-          Write-Host "appdir = $($exe.Directory.FullName)"
-      - name: Shape test
+      - name: Bisect 3500-3600
         continue-on-error: true
         run: |
           $ErrorActionPreference = "Continue"
-          $src = "${{ steps.inst.outputs.appdir }}"
-          $mk  = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
-          $ver = "1.0.$env:GITHUB_RUN_NUMBER.0"
-          $sum = "s-shape.log"
-          "=== 形状测试：区分体积限制 vs 文件数限制 ===" | Out-File $sum -Encoding UTF8
-          "version = $ver" | Out-File $sum -Append -Encoding UTF8
+          $src  = "${{ steps.inst.outputs.appdir }}"
+          $mk   = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
+          $ver  = "1.0.$env:GITHUB_RUN_NUMBER.0"
+          $sum  = "s-bisect.log"
+          "=== bisect 3500-3600 ===" | Out-File $sum -Encoding UTF8
 
           $full = "C:\Full"
           if (Test-Path $full) { Remove-Item $full -Recurse -Force -ErrorAction SilentlyContinue }
@@ -43,8 +41,11 @@ jobs:
 
           $alpha = @(Get-ChildItem $full -Recurse -File -Force |
                      Where-Object { $_.Name -ne "AppxManifest.xml" } | Sort-Object FullName)
-          $bySize = @($alpha | Sort-Object Length -Descending)
-          "total files = $($alpha.Count)" | Out-File $sum -Append -Encoding UTF8
+          $N = $alpha.Count
+          "total = $N" | Out-File $sum -Append -Encoding UTF8
+          for ($i = 3498; $i -lt 3600; $i++) {
+            "  [$($i+1)] " + $alpha[$i].FullName.Substring($full.Length) + "  " + $alpha[$i].Length | Out-File $sum -Append -Encoding UTF8
+          }
           "" | Out-File $sum -Append -Encoding UTF8
 
           $mlines = @(
@@ -63,12 +64,13 @@ jobs:
           $manifest = $mlines -join "`r`n"
           Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
 
-          function DoPack($label, $fileList) {
+          $script:results = @()
+
+          function TryPack($label, $list) {
             $stage = "C:\S"
             if (Test-Path $stage) { Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue }
             New-Item -ItemType Directory -Force -Path $stage | Out-Null
-
-            foreach ($f in $fileList) {
+            foreach ($f in $list) {
               try {
                 $rel = $f.FullName.Substring($full.Length).TrimStart('\')
                 $tgt = Join-Path $stage $rel
@@ -89,41 +91,50 @@ jobs:
                 $g.Dispose(); $b.Dispose()
               } catch {}
             }
-
-            $rawMB = [math]::Round((($fileList | Measure-Object Length -Sum).Sum)/1MB, 1)
-            $n = (Get-ChildItem $stage -Recurse -File -Force).Count
-            $out = "C:\out\$label.appx"
+            $rawMB = [math]::Round((($list | Measure-Object Length -Sum).Sum)/1MB, 1)
+            $cnt   = (Get-ChildItem $stage -Recurse -File -Force).Count
+            $out   = "C:\out\$label.appx"
             New-Item -ItemType Directory -Force -Path "C:\out" | Out-Null
             Remove-Item $out -Force -ErrorAction SilentlyContinue
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $sw  = [System.Diagnostics.Stopwatch]::StartNew()
             $log = & $mk pack /d $stage /p $out /o 2>&1
             $sw.Stop()
             $ok = Test-Path $out
-            $pkMB = if ($ok) { "{0:N1}MB" -f ((Get-Item $out).Length/1MB) } else { "-" }
-            $line = "{0,-22} files={1,5}  raw={2,7}MB  ->  {3}  {$4}  {5,3}s" -f $label, $n, $rawMB, $(if($ok){"OK  "}else{"FAIL"}), $pkMB, [math]::Round($sw.Elapsed.TotalSeconds)
+            $pkMB = "-"
+            if ($ok) { $pkMB = ("{0:N1}MB" -f ((Get-Item $out).Length/1MB)) }
+            $status = "FAIL"
+            if ($ok) { $status = "OK  " }
+            $line = $label.PadRight(20) + " n=" + $cnt.ToString().PadLeft(5) + "  raw=" + $rawMB.ToString().PadLeft(7) + "MB  -> " + $status + "  pkg=" + $pkMB.PadLeft(9) + "  " + [math]::Round($sw.Elapsed.TotalSeconds) + "s"
             Write-Host $line
             $line | Out-File $sum -Append -Encoding UTF8
             if (-not $ok) {
-              ($log | Where-Object { $_ -match 'error' } | Select-Object -Last 1) | ForEach-Object { "      " + $_.Trim() } | Out-File $sum -Append -Encoding UTF8
+              $e = ($log | Where-Object { $_ -match 'error' } | Select-Object -Last 1)
+              if ($e) { ("      " + $e.Trim()) | Out-File $sum -Append -Encoding UTF8 }
             }
             Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
             Remove-Item $out -Force -ErrorAction SilentlyContinue
+            return $ok
           }
 
-          # ① 前 3500（已知成功，基准）
-          DoPack "A_first3500"  ($alpha | Select-Object -First 3500)
+          $head3500 = @($alpha | Select-Object -First 3500)
+          $r3501_3550 = @($alpha[3500..3549])
+          $r3551_3600 = @($alpha[3550..3599])
+          $tail = @($alpha | Select-Object -Skip 3600)
 
-          # ② 剩余部分：6272 个文件，但体积小
-          DoPack "B_rest6272"   ($alpha | Select-Object -Skip 3500)
+          "#1  head3500 only"       | Out-File $sum -Append -Encoding UTF8
+          TryPack "head3500" $head3500 | Out-Null
 
-          # ③ 最大的 30 个文件：文件极少，体积大
-          DoPack "C_top30big"   ($bySize | Select-Object -First 30)
+          "#2  head3500 + 3501..3550" | Out-File $sum -Append -Encoding UTF8
+          TryPack "head_plus_3501_3550" ($head3500 + $r3501_3550) | Out-Null
 
-          # ④ 最大的 15 个文件
-          DoPack "D_top15big"   ($bySize | Select-Object -First 15)
+          "#3  head3500 + 3551..3600" | Out-File $sum -Append -Encoding UTF8
+          TryPack "head_plus_3551_3600" ($head3500 + $r3551_3600) | Out-Null
 
-          # ⑤ 前 3600（已知失败，对照）
-          DoPack "E_first3600"  ($alpha | Select-Object -First 3600)
+          "#4  head3500 + tail (skip 3501-3600)" | Out-File $sum -Append -Encoding UTF8
+          TryPack "head_plus_tail" ($head3500 + $tail) | Out-Null
+
+          "#5  full 9772 (control)" | Out-File $sum -Append -Encoding UTF8
+          TryPack "full" $alpha | Out-Null
 
           "=== end ===" | Out-File $sum -Append -Encoding UTF8
           Get-Content $sum
@@ -136,15 +147,15 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout --orphan diag-logs 2>/dev/null || git checkout diag-logs
           git rm -r --cached . -q 2>/dev/null || true
-          [ -f s-shape.log ] && cp s-shape.log . || true
+          [ -f s-bisect.log ] && cp s-bisect.log . || true
           git add -f *.log 2>/dev/null || true
-          git commit -m "shape ${{ github.run_id }}" || echo "nothing"
+          git commit -m "bisect ${{ github.run_id }}" || echo "nothing"
           git push -f origin diag-logs || echo "push failed"
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: winapp-logs
-          path: s-shape.log
+          path: s-bisect.log
           if-no-files-found: warn
           retention-days: 14
