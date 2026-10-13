@@ -12,53 +12,41 @@ jobs:
         shell: pwsh
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-      - name: Silent install
+      - name: Install app
         id: inst
         run: |
           $tmp = "$env:RUNNER_TEMP\dsh.exe"
           curl.exe -L --retry 3 --max-time 1800 -o $tmp "https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe"
           if ((Get-Item $tmp).Length -lt 200MB) { throw "download too small" }
-          $target = "C:\DSHApp"
-          New-Item -ItemType Directory -Force -Path $target | Out-Null
-          $p = Start-Process -FilePath $tmp -ArgumentList "/S", "/D=$target" -Wait -PassThru
-          Start-Sleep -Seconds 6
-          $exe = Get-ChildItem $target -Recurse -Filter "DeepSeek Harness.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $exe) { throw "app exe not found" }
-          $n = (Get-ChildItem $target -Recurse -File -ErrorAction SilentlyContinue).Count
-          Write-Host "appdir = $($exe.Directory.FullName)  files = $n"
+          $t = "C:\DSHApp"
+          New-Item -ItemType Directory -Force -Path $t | Out-Null
+          Start-Process -FilePath $tmp -ArgumentList "/S","/D=$t" -Wait
+          Start-Sleep 6
+          $exe = Get-ChildItem $t -Recurse -Filter "DeepSeek Harness.exe" | Select-Object -First 1
+          if (-not $exe) { throw "no exe" }
+          Write-Host "appdir = $($exe.Directory.FullName)"
           "appdir=$($exe.Directory.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
-      - name: Threshold scan
+      - name: Fine scan 3000-4000
         continue-on-error: true
         run: |
           $ErrorActionPreference = "Continue"
           $src = "${{ steps.inst.outputs.appdir }}"
-          $mk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
-          if (-not (Test-Path $mk)) {
-            $mk = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Filter makeappx.exe -Recurse -ErrorAction SilentlyContinue |
-              Where-Object { $_.FullName -match "\\x64\\" } | Sort-Object FullName -Descending | Select-Object -First 1).FullName
-          }
-          Write-Host "makeappx = $mk"
+          $mk  = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
           $ver = "1.0.$env:GITHUB_RUN_NUMBER.0"
-          $summary = "s-scan.log"
-          "=== 阈值扫描 ===" | Out-File $summary -Encoding UTF8
-          "version = $ver" | Out-File $summary -Append -Encoding UTF8
-          New-Item -ItemType Directory -Force -Path "C:\out" | Out-Null
-          New-Item -ItemType Directory -Force -Path dist-msix | Out-Null
+          $sum = "s-scan.log"
+          "=== fine scan 3000-4000 ===" | Out-File $sum -Encoding UTF8
+          "version = $ver" | Out-File $sum -Append -Encoding UTF8
 
-          # 全量暂存一次
           $full = "C:\Full"
           if (Test-Path $full) { Remove-Item $full -Recurse -Force -ErrorAction SilentlyContinue }
           robocopy $src $full /E /NFL /NDL /NP /R:1 /W:1 | Out-Null
-          $all = Get-ChildItem $full -Recurse -File -Force -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -ne "AppxManifest.xml" } | Sort-Object FullName
-          $total = $all.Count
-          Write-Host "总文件数 = $total"
-          "暂存文件数 = $total" | Out-File $summary -Append -Encoding UTF8
-          "" | Out-File $summary -Append -Encoding UTF8
 
-          $manifestLines = @(
+          $all = @(Get-ChildItem $full -Recurse -File -Force -ErrorAction SilentlyContinue |
+                   Where-Object { $_.Name -ne "AppxManifest.xml" } | Sort-Object FullName)
+          "total = $($all.Count)" | Out-File $sum -Append -Encoding UTF8
+          "" | Out-File $sum -Append -Encoding UTF8
+
+          $mlines = @(
           '<?xml version="1.0" encoding="utf-8"?>'
           '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap rescap">'
           ('  <Identity Name="14714BE0.320850A8A419A" Publisher="CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" Version="' + $ver + '" ProcessorArchitecture="x64" />')
@@ -71,14 +59,14 @@ jobs:
           '  </Application></Applications>'
           '</Package>'
           )
+          $manifest = $mlines -join "`r`n"
+          Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
 
-          foreach ($limit in @(3000, 4000, 4500, 5000)) {
-            $stage = "C:\S$limit"
+          foreach ($limit in @(3000,3100,3200,3300,3400,3500,3600,3700,3800,3900,4000)) {
+            $stage = "C:\S"
             if (Test-Path $stage) { Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue }
             New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
-            # 用 robocopy 按相对路径复制前 N 个文件（逐文件，但带异常吞掉）
-            $copied = 0
             foreach ($f in ($all | Select-Object -First $limit)) {
               try {
                 $rel = $f.FullName.Substring($full.Length).TrimStart('\')
@@ -86,52 +74,42 @@ jobs:
                 $td = [System.IO.Path]::GetDirectoryName($tgt)
                 if (-not (Test-Path $td)) { New-Item -ItemType Directory -Force -Path $td -ErrorAction SilentlyContinue | Out-Null }
                 [System.IO.File]::Copy($f.FullName, $tgt, $true)
-                $copied++
-              } catch { }
+              } catch {}
             }
-
-            [System.IO.File]::WriteAllText((Join-Path $stage "AppxManifest.xml"), ($manifestLines -join "`r`n"), (New-Object System.Text.UTF8Encoding $false))
+            [System.IO.File]::WriteAllText((Join-Path $stage "AppxManifest.xml"), $manifest, (New-Object System.Text.UTF8Encoding $false))
             $as = Join-Path $stage "Assets"
             New-Item -ItemType Directory -Force -Path $as | Out-Null
-            Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
-            foreach ($spec in @(@(50,50,"StoreLogo.png"), @(44,44,"Square44x44Logo.png"), @(150,150,"Square150x150Logo.png"), @(310,150,"Wide310x150Logo.png"))) {
+            foreach ($s in @(@(50,50,"StoreLogo.png"),@(44,44,"Square44x44Logo.png"),@(150,150,"Square150x150Logo.png"),@(310,150,"Wide310x150Logo.png"))) {
               try {
-                $b = New-Object System.Drawing.Bitmap $spec[0], $spec[1]
+                $b = New-Object System.Drawing.Bitmap $s[0], $s[1]
                 $g = [System.Drawing.Graphics]::FromImage($b)
                 $g.Clear([System.Drawing.Color]::FromArgb(58,95,170))
-                $b.Save((Join-Path $as $spec[2]), [System.Drawing.Imaging.ImageFormat]::Png)
+                $b.Save((Join-Path $as $s[2]), [System.Drawing.Imaging.ImageFormat]::Png)
                 $g.Dispose(); $b.Dispose()
-              } catch { }
+              } catch {}
             }
 
-            $real = (Get-ChildItem $stage -Recurse -File -Force -ErrorAction SilentlyContinue).Count
-            Write-Host ""
-            Write-Host "========== limit=$limit  copied=$copied  实际=$real =========="
-
-            $outPkg = "C:\out\l$limit.appx"
-            Remove-Item $outPkg -Force -ErrorAction SilentlyContinue
-            $log = "b-$limit.log"
+            $out = "C:\out\l$limit.appx"
+            New-Item -ItemType Directory -Force -Path "C:\out" | Out-Null
+            Remove-Item $out -Force -ErrorAction SilentlyContinue
             $sw = [System.Diagnostics.Stopwatch]::StartNew()
-            & $mk pack /d $stage /p $outPkg /o 2>&1 | Out-File $log -Encoding UTF8
+            $log = & $mk pack /d $stage /p $out /o 2>&1
             $code = $LASTEXITCODE
             $sw.Stop()
-            $el = [math]::Round($sw.Elapsed.TotalSeconds)
-            $proc = (Get-Content $log -ErrorAction SilentlyContinue | Where-Object { $_ -match 'as a payload file' }).Count
-            if (Test-Path $outPkg) {
-              $mb = [math]::Round((Get-Item $outPkg).Length/1MB,1)
-              Write-Host "  *** SUCCESS $mb MB (${el}s) ***"
-              "limit=$limit  SUCCESS  ${mb}MB  real=$real  processed=$proc  ${el}s" | Out-File $summary -Append -Encoding UTF8
-              Copy-Item $outPkg "dist-msix\bluefish-l$limit.appx" -Force
-            } else {
-              Write-Host "  *** FAILED processed=$proc (${el}s) ***"
-              "limit=$limit  FAILED   real=$real  processed=$proc  ${el}s" | Out-File $summary -Append -Encoding UTF8
+            $ok = Test-Path $out
+            $boundary = $all[$limit-1].FullName.Substring($full.Length)
+            $sizeTxt = if ($ok) { "{0:N1}MB" -f ((Get-Item $out).Length/1MB) } else { "-" }
+            $line = "{0,5}  {1}  code={2}  {3,4}s  {4,9}  idx{0}={5}" -f $limit, $(if($ok){"OK  "}else{"FAIL"}), $code, [math]::Round($sw.Elapsed.TotalSeconds), $sizeTxt, $boundary
+            Write-Host $line
+            $line | Out-File $sum -Append -Encoding UTF8
+            if (-not $ok) {
+              ($log | Where-Object { $_ -match 'error' } | Select-Object -Last 1) | ForEach-Object { "        " + $_.Trim() } | Out-File $sum -Append -Encoding UTF8
             }
             Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item $out -Force -ErrorAction SilentlyContinue
           }
-
-          "" | Out-File $summary -Append -Encoding UTF8
-          "=== end ===" | Out-File $summary -Append -Encoding UTF8
-          Get-Content $summary
+          "=== end ===" | Out-File $sum -Append -Encoding UTF8
+          Get-Content $sum
       - name: Commit logs
         if: always()
         shell: bash
@@ -141,26 +119,15 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout --orphan diag-logs 2>/dev/null || git checkout diag-logs
           git rm -r --cached . -q 2>/dev/null || true
-          for f in s-scan.log b-3000.log b-4000.log b-4500.log b-5000.log; do
-            [ -f "$f" ] && cp "$f" . 2>/dev/null || true
-          done
+          [ -f s-scan.log ] && cp s-scan.log . || true
           git add -f *.log 2>/dev/null || true
-          git commit -m "logs run ${{ github.run_id }}" || echo "nothing"
+          git commit -m "scan ${{ github.run_id }}" || echo "nothing"
           git push -f origin diag-logs || echo "push failed"
-      - name: Upload
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: dsh-msix
-          path: dist-msix/*
-          if-no-files-found: warn
-          retention-days: 30
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: winapp-logs
-          path: |
-            *.log
+          path: s-scan.log
           if-no-files-found: warn
           retention-days: 14
