@@ -27,7 +27,7 @@ jobs:
           N="$L|$M"
           O=""
           [ -f .dsh-hash ] && O=$(cat .dsh-hash | tr -d '\r\n')
-          echo "new=$N old=$O force=${{ github.event.inputs.force }}"
+          echo "new=$N old=$O"
           if [ "${{ github.event.inputs.force }}" = "true" ] || [ "$N" != "$O" ]; then
             echo "changed=true" >> $GITHUB_OUTPUT
           else
@@ -56,10 +56,9 @@ jobs:
           $e = Get-ChildItem C:\A -Recurse -Filter "DeepSeek Harness.exe" | Select-Object -First 1
           if (-not $e) { throw "no exe" }
           Write-Host "files = $((Get-ChildItem C:\A -Recurse -File -Force).Count)"
-          "d=C:\A" | Out-File -Append $env:GITHUB_OUTPUT
       - name: Pack
         run: |
-          $d = "${{ steps.i.outputs.d }}"
+          $d = "C:\A"
           $mk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
           $v = "1.0.$env:GITHUB_RUN_NUMBER.0"
           $s = "C:\S"
@@ -116,22 +115,40 @@ jobs:
           git push || true
   publish:
     needs: [build]
-    if: needs.build.result == 'success' && secrets.STORE_PRODUCT_ID != ''
+    if: needs.build.result == 'success'
     runs-on: windows-latest
     steps:
+      - name: Check secrets
+        id: s
+        shell: pwsh
+        run: |
+          if ("${{ secrets.STORE_PRODUCT_ID }}" -ne "") {
+            "ok=true" | Out-File -Append $env:GITHUB_OUTPUT
+          } else {
+            Write-Host "未配置 Secrets，跳过发布"
+            "ok=false" | Out-File -Append $env:GITHUB_OUTPUT
+          }
       - uses: actions/checkout@v4
+        if: steps.s.outputs.ok == 'true'
       - uses: microsoft/microsoft-store-apppublisher@v1.1
-      - run: |
+        if: steps.s.outputs.ok == 'true'
+      - name: Configure
+        if: steps.s.outputs.ok == 'true'
+        run: |
           msstore reconfigure `
             --tenantId ${{ secrets.AZURE_AD_TENANT_ID }} `
             --sellerId ${{ secrets.SELLER_ID }} `
             --clientId ${{ secrets.AZURE_AD_APPLICATION_CLIENT_ID }} `
             --clientSecret ${{ secrets.AZURE_AD_APPLICATION_SECRET }}
       - uses: actions/download-artifact@v4
+        if: steps.s.outputs.ok == 'true'
         with:
           name: dsh-msix
           path: ./r
-      - shell: pwsh
+      - name: Publish
+        if: steps.s.outputs.ok == 'true'
+        shell: pwsh
         run: |
           $p = Get-ChildItem ./r -Include *.appx,*.msix -Recurse | Select-Object -First 1
+          Write-Host "publishing $($p.FullName)"
           msstore publish "$($p.FullName)" -id ${{ secrets.STORE_PRODUCT_ID }} --packageRolloutPercentage 5
