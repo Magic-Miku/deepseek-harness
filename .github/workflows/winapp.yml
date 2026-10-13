@@ -34,6 +34,19 @@ jobs:
             echo "changed=false" >> $GITHUB_OUTPUT
           fi
           echo "hash=$N" >> $GITHUB_OUTPUT
+      - name: Heartbeat
+        if: always()
+        shell: bash
+        continue-on-error: true
+        run: |
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+          TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          printf '%s | changed=%s | %s\n' "$TS" "${{ steps.c.outputs.changed }}" "${{ steps.c.outputs.hash }}" > .dsh-heartbeat
+          git add .dsh-heartbeat
+          git diff --cached --quiet && echo "no change" && exit 0
+          git commit -m "chore: heartbeat [skip ci]"
+          git push || echo "push failed"
   build:
     needs: [check]
     if: needs.check.outputs.changed == 'true'
@@ -141,7 +154,8 @@ jobs:
           git config user.email "bot@users.noreply.github.com"
           echo "${{ needs.check.outputs.hash }}" > .dsh-hash
           git add .dsh-hash
-          git commit -m "hash [skip ci]" || true
+          git diff --cached --quiet && echo "hash unchanged" && exit 0
+          git commit -m "hash [skip ci]"
           git push || true
       - name: Send email
         if: success()
