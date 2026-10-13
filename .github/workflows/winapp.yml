@@ -67,31 +67,57 @@ jobs:
           Write-Host "staged = $((Get-ChildItem $s -Recurse -File -Force).Count)"
           $x = @(
             '<?xml version="1.0" encoding="utf-8"?>'
-            '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap rescap">'
-            ('<Identity Name="14714BE0.320850A8A419A" Publisher="CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" Version="' + $v + '" ProcessorArchitecture="x64" />')
-            '<Properties><DisplayName>BlueFish</DisplayName><PublisherDisplayName>Miku</PublisherDisplayName><Logo>Assets\StoreLogo.png</Logo></Properties>'
-            '<Dependencies><TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.19041.0" /></Dependencies>'
-            '<Resources><Resource Language="en-us" /></Resources>'
-            '<Capabilities><Capability Name="internetClient" /><rescap:Capability Name="runFullTrust" /></Capabilities>'
-            '<Applications><Application Id="App" Executable="DeepSeek Harness.exe" EntryPoint="Windows.FullTrustApplication">'
-            '<uap:VisualElements DisplayName="BlueFish" Description="BlueFish" BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png" />'
-            '</Application></Applications></Package>'
+            '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10" xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10" xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities" IgnorableNamespaces="uap rescap" xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest">'
+            ('  <Identity Name="14714BE0.320850A8A419A" Publisher="CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD" Version="' + $v + '" />')
+            '  <Properties>'
+            '    <DisplayName>BlueFish</DisplayName>'
+            '    <PublisherDisplayName>Miku</PublisherDisplayName>'
+            '    <Description>BlueFish - Electron desktop shell for a bundled dsh runtime and external plugins</Description>'
+            '    <Logo>Assets\StoreLogo.png</Logo>'
+            '  </Properties>'
+            '  <Dependencies>'
+            '    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.19041.0" />'
+            '  </Dependencies>'
+            '  <Resources>'
+            '    <Resource Language="en-us" />'
+            '    <Resource Language="zh-cn" />'
+            '  </Resources>'
+            '  <Applications>'
+            '    <Application Id="App" Executable="DeepSeek Harness.exe" EntryPoint="Windows.FullTrustApplication">'
+            '      <uap:VisualElements DisplayName="BlueFish" Description="BlueFish - A powerful AI development environment" BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png">'
+            '        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" Square310x310Logo="Assets\Square310x310Logo.png" Square71x71Logo="Assets\Square71x71Logo.png">'
+            '          <uap:ShowNameOnTiles>'
+            '            <uap:ShowOn Tile="square150x150Logo" />'
+            '            <uap:ShowOn Tile="wide310x150Logo" />'
+            '            <uap:ShowOn Tile="square310x310Logo" />'
+            '          </uap:ShowNameOnTiles>'
+            '        </uap:DefaultTile>'
+            '        <uap:SplashScreen Image="Assets\SplashScreen.png" />'
+            '        <uap:LockScreen BadgeLogo="Assets\BadgeLogo.png" Notification="badgeAndTileText" />'
+            '      </uap:VisualElements>'
+            '    </Application>'
+            '  </Applications>'
+            '  <Capabilities>'
+            '    <Capability Name="internetClient" />'
+            '    <Capability Name="internetClientServer" />'
+            '    <Capability Name="privateNetworkClientServer" />'
+            '    <rescap:Capability Name="runFullTrust" />'
+            '  </Capabilities>'
+            '  <mp:PhoneIdentity PhoneProductId="49e5ab4f-088e-46fc-bf22-b748a9999b08" PhonePublisherId="1bf42279-ce31-40ab-8b3e-fcd19d939971" />'
+            '</Package>'
           )
           [IO.File]::WriteAllText("$s\AppxManifest.xml", ($x -join "`n"), (New-Object Text.UTF8Encoding $false))
-          # 图标：从仓库读取（不再用纯色方块）
           $a = "$s\Assets"
           New-Item -ItemType Directory -Force -Path $a | Out-Null
           $src = "$env:GITHUB_WORKSPACE\.github\store-icons"
-          $want = @("StoreLogo.png","Square44x44Logo.png","Square71x71Logo.png","Square150x150Logo.png","Square310x310Logo.png","Wide310x150Logo.png","SplashScreen.png","BadgeLogo.png")
+          $want = @("AppList.png","BadgeLogo.png","LargeTile.png","MediumTile.png","SmallTile.png","SplashScreen.png","Square150x150Logo.png","Square310x310Logo.png","Square44x44Logo.png","Square71x71Logo.png","StoreLogo.png","Wide310x150Logo.png","WideTile.png")
           $ok = 0
           foreach ($n in $want) {
             $p = Join-Path $src $n
-            if (Test-Path $p) { Copy-Item $p (Join-Path $a $n) -Force; $ok++ }
-            else { Write-Host "  missing: $n" }
+            if (Test-Path $p) { Copy-Item $p (Join-Path $a $n) -Force; $ok++ } else { Write-Host "  missing: $n" }
           }
           Write-Host "icons copied = $ok / $($want.Count)"
-          if ($ok -lt 4) { throw "too few icons" }
-          Get-ChildItem $a | ForEach-Object { Write-Host ("  " + $_.Name + "  " + $_.Length + " B") }
+          if ($ok -lt 13) { throw "icons incomplete: $ok" }
           New-Item -ItemType Directory -Force -Path C:\out | Out-Null
           & $mk pack /d $s /p C:\out\b.appx /o 2>&1 | Tee-Object b.log
           if (-not (Test-Path C:\out\b.appx)) { Get-Content b.log | Select-Object -Last 5; throw "pack failed" }
