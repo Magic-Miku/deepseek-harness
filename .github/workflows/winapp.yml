@@ -24,26 +24,27 @@ jobs:
           Start-Sleep 6
           $exe = Get-ChildItem $t -Recurse -Filter "DeepSeek Harness.exe" | Select-Object -First 1
           if (-not $exe) { throw "no exe" }
-          Write-Host "appdir = $($exe.Directory.FullName)"
           "appdir=$($exe.Directory.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
-      - name: Fine scan 3000-4000
+          Write-Host "appdir = $($exe.Directory.FullName)"
+      - name: Shape test
         continue-on-error: true
         run: |
           $ErrorActionPreference = "Continue"
           $src = "${{ steps.inst.outputs.appdir }}"
           $mk  = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
           $ver = "1.0.$env:GITHUB_RUN_NUMBER.0"
-          $sum = "s-scan.log"
-          "=== fine scan 3000-4000 ===" | Out-File $sum -Encoding UTF8
+          $sum = "s-shape.log"
+          "=== 形状测试：区分体积限制 vs 文件数限制 ===" | Out-File $sum -Encoding UTF8
           "version = $ver" | Out-File $sum -Append -Encoding UTF8
 
           $full = "C:\Full"
           if (Test-Path $full) { Remove-Item $full -Recurse -Force -ErrorAction SilentlyContinue }
           robocopy $src $full /E /NFL /NDL /NP /R:1 /W:1 | Out-Null
 
-          $all = @(Get-ChildItem $full -Recurse -File -Force -ErrorAction SilentlyContinue |
-                   Where-Object { $_.Name -ne "AppxManifest.xml" } | Sort-Object FullName)
-          "total = $($all.Count)" | Out-File $sum -Append -Encoding UTF8
+          $alpha = @(Get-ChildItem $full -Recurse -File -Force |
+                     Where-Object { $_.Name -ne "AppxManifest.xml" } | Sort-Object FullName)
+          $bySize = @($alpha | Sort-Object Length -Descending)
+          "total files = $($alpha.Count)" | Out-File $sum -Append -Encoding UTF8
           "" | Out-File $sum -Append -Encoding UTF8
 
           $mlines = @(
@@ -62,16 +63,16 @@ jobs:
           $manifest = $mlines -join "`r`n"
           Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
 
-          foreach ($limit in @(3000,3100,3200,3300,3400,3500,3600,3700,3800,3900,4000)) {
+          function DoPack($label, $fileList) {
             $stage = "C:\S"
             if (Test-Path $stage) { Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue }
             New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
-            foreach ($f in ($all | Select-Object -First $limit)) {
+            foreach ($f in $fileList) {
               try {
                 $rel = $f.FullName.Substring($full.Length).TrimStart('\')
                 $tgt = Join-Path $stage $rel
-                $td = [System.IO.Path]::GetDirectoryName($tgt)
+                $td  = [System.IO.Path]::GetDirectoryName($tgt)
                 if (-not (Test-Path $td)) { New-Item -ItemType Directory -Force -Path $td -ErrorAction SilentlyContinue | Out-Null }
                 [System.IO.File]::Copy($f.FullName, $tgt, $true)
               } catch {}
@@ -89,25 +90,41 @@ jobs:
               } catch {}
             }
 
-            $out = "C:\out\l$limit.appx"
+            $rawMB = [math]::Round((($fileList | Measure-Object Length -Sum).Sum)/1MB, 1)
+            $n = (Get-ChildItem $stage -Recurse -File -Force).Count
+            $out = "C:\out\$label.appx"
             New-Item -ItemType Directory -Force -Path "C:\out" | Out-Null
             Remove-Item $out -Force -ErrorAction SilentlyContinue
             $sw = [System.Diagnostics.Stopwatch]::StartNew()
             $log = & $mk pack /d $stage /p $out /o 2>&1
-            $code = $LASTEXITCODE
             $sw.Stop()
             $ok = Test-Path $out
-            $boundary = $all[$limit-1].FullName.Substring($full.Length)
-            $sizeTxt = if ($ok) { "{0:N1}MB" -f ((Get-Item $out).Length/1MB) } else { "-" }
-            $line = "{0,5}  {1}  code={2}  {3,4}s  {4,9}  idx{0}={5}" -f $limit, $(if($ok){"OK  "}else{"FAIL"}), $code, [math]::Round($sw.Elapsed.TotalSeconds), $sizeTxt, $boundary
+            $pkMB = if ($ok) { "{0:N1}MB" -f ((Get-Item $out).Length/1MB) } else { "-" }
+            $line = "{0,-22} files={1,5}  raw={2,7}MB  ->  {3}  {$4}  {5,3}s" -f $label, $n, $rawMB, $(if($ok){"OK  "}else{"FAIL"}), $pkMB, [math]::Round($sw.Elapsed.TotalSeconds)
             Write-Host $line
             $line | Out-File $sum -Append -Encoding UTF8
             if (-not $ok) {
-              ($log | Where-Object { $_ -match 'error' } | Select-Object -Last 1) | ForEach-Object { "        " + $_.Trim() } | Out-File $sum -Append -Encoding UTF8
+              ($log | Where-Object { $_ -match 'error' } | Select-Object -Last 1) | ForEach-Object { "      " + $_.Trim() } | Out-File $sum -Append -Encoding UTF8
             }
             Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
             Remove-Item $out -Force -ErrorAction SilentlyContinue
           }
+
+          # ① 前 3500（已知成功，基准）
+          DoPack "A_first3500"  ($alpha | Select-Object -First 3500)
+
+          # ② 剩余部分：6272 个文件，但体积小
+          DoPack "B_rest6272"   ($alpha | Select-Object -Skip 3500)
+
+          # ③ 最大的 30 个文件：文件极少，体积大
+          DoPack "C_top30big"   ($bySize | Select-Object -First 30)
+
+          # ④ 最大的 15 个文件
+          DoPack "D_top15big"   ($bySize | Select-Object -First 15)
+
+          # ⑤ 前 3600（已知失败，对照）
+          DoPack "E_first3600"  ($alpha | Select-Object -First 3600)
+
           "=== end ===" | Out-File $sum -Append -Encoding UTF8
           Get-Content $sum
       - name: Commit logs
@@ -119,15 +136,15 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout --orphan diag-logs 2>/dev/null || git checkout diag-logs
           git rm -r --cached . -q 2>/dev/null || true
-          [ -f s-scan.log ] && cp s-scan.log . || true
+          [ -f s-shape.log ] && cp s-shape.log . || true
           git add -f *.log 2>/dev/null || true
-          git commit -m "scan ${{ github.run_id }}" || echo "nothing"
+          git commit -m "shape ${{ github.run_id }}" || echo "nothing"
           git push -f origin diag-logs || echo "push failed"
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: winapp-logs
-          path: s-scan.log
+          path: s-shape.log
           if-no-files-found: warn
           retention-days: 14
