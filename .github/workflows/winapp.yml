@@ -25,15 +25,14 @@ jobs:
           $exe = Get-ChildItem $t -Recurse -Filter "DeepSeek Harness.exe" | Select-Object -First 1
           if (-not $exe) { throw "no exe" }
           "appdir=$($exe.Directory.FullName)" | Out-File -Append $env:GITHUB_OUTPUT
-      - name: Test dot-prefixed filenames
+      - name: Isolate culprit
         continue-on-error: true
         run: |
           $ErrorActionPreference = "Continue"
           $src = "${{ steps.inst.outputs.appdir }}"
           $mk  = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe"
           $ver = "1.0.$env:GITHUB_RUN_NUMBER.0"
-          $sum = "s-dot.log"
-          "=== .rels / 点开头文件测试 ===" | Out-File $sum -Encoding UTF8
+          $sum = "s-iso.log"
 
           $full = "C:\Full"
           if (Test-Path $full) { Remove-Item $full -Recurse -Force -ErrorAction SilentlyContinue }
@@ -41,13 +40,22 @@ jobs:
 
           $alpha = @(Get-ChildItem $full -Recurse -File -Force |
                      Where-Object { $_.Name -ne "AppxManifest.xml" } | Sort-Object FullName)
-          "total = $($alpha.Count)" | Out-File $sum -Append -Encoding UTF8
 
-          # 找出所有"点开头"或"无扩展名主体"的文件
-          $dots = @($alpha | Where-Object { $_.Name.StartsWith(".") })
-          "点开头的文件数 = $($dots.Count)" | Out-File $sum -Append -Encoding UTF8
-          foreach ($d in $dots) {
-            "  " + $d.FullName.Substring($full.Length) + "   " + $d.Length | Out-File $sum -Append -Encoding UTF8
+          "=== 隔离测试 ===" | Out-File $sum -Encoding UTF8
+          "total = $($alpha.Count)" | Out-File $sum -Append -Encoding UTF8
+          "" | Out-File $sum -Append -Encoding UTF8
+          "--- 3551..3600 清单 ---" | Out-File $sum -Append -Encoding UTF8
+          for ($i = 3550; $i -lt 3600; $i++) {
+            $nm = $alpha[$i].FullName.Substring($full.Length)
+            $ln = $alpha[$i].Length
+            ("  [" + ($i+1) + "] " + $ln + "  " + $nm) | Out-File $sum -Append -Encoding UTF8
+          }
+          "" | Out-File $sum -Append -Encoding UTF8
+
+          $relsFiles = @($alpha | Where-Object { $_.FullName -match '\\_rels\\' })
+          "含 _rels 目录的文件数 = $($relsFiles.Count)" | Out-File $sum -Append -Encoding UTF8
+          foreach ($r in $relsFiles) {
+            "  " + $r.FullName.Substring($full.Length) | Out-File $sum -Append -Encoding UTF8
           }
           "" | Out-File $sum -Append -Encoding UTF8
 
@@ -67,7 +75,7 @@ jobs:
           $manifest = $mlines -join "`r`n"
           Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
 
-          function RunPack($label, $list) {
+          function RunPack([string]$label, $list, [bool]$keep) {
             $stage = "C:\S"
             if (Test-Path $stage) { Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue }
             New-Item -ItemType Directory -Force -Path $stage | Out-Null
@@ -102,36 +110,34 @@ jobs:
             if ($ok) { $st = "OK" }
             $pk = "-"
             if ($ok) { $pk = [string][math]::Round((Get-Item $out).Length/1MB,1) + "MB" }
-            $line = $label.PadRight(24) + " n=" + $n.ToString().PadLeft(5) + "  -> " + $st.PadRight(5) + " pkg=" + $pk
+            $line = $label + "  n=" + $n + "  -> " + $st + "  pkg=" + $pk
             Write-Host $line
             $line | Out-File $sum -Append -Encoding UTF8
             if (-not $ok) {
               $e = ($log | Where-Object { $_ -match 'error' } | Select-Object -Last 1)
               if ($e) { ("      " + $e.Trim()) | Out-File $sum -Append -Encoding UTF8 }
             }
-            if ($ok -and $label -eq "D_final") {
+            if ($ok -and $keep) {
               New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\dist-msix" | Out-Null
-              Copy-Item $out "$env:GITHUB_WORKSPACE\dist-msix\bluefish.appx" -Force
+              Copy-Item $out ("$env:GITHUB_WORKSPACE\dist-msix\" + $label + ".appx") -Force
             }
             Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
             Remove-Item $out -Force -ErrorAction SilentlyContinue
-            return $ok
           }
 
-          $noDots = @($alpha | Where-Object { -not $_.Name.StartsWith(".") })
-          $onlyDots = @($alpha | Where-Object { $_.Name.StartsWith(".") })
+          $base = @($alpha | Select-Object -First 3500)
 
-          "A_all_original" | Out-File $sum -Append -Encoding UTF8
-          RunPack "A_all" $alpha | Out-Null
+          RunPack "T1_base3500" $base $false
+          RunPack "T2_add_3551_3575" ($base + @($alpha[3550..3574])) $false
+          RunPack "T3_add_3576_3600" ($base + @($alpha[3575..3599])) $false
 
-          "B_exclude_dot_files (排除点开头)" | Out-File $sum -Append -Encoding UTF8
-          RunPack "B_no_dots" $noDots | Out-Null
+          $noRels = @($alpha | Where-Object { $_.FullName -notmatch '\\_rels\\' })
+          RunPack "T4_all_no_rels" $noRels $true
 
-          "C_only_dot_files (只要点开头)" | Out-File $sum -Append -Encoding UTF8
-          RunPack "C_only_dots" $onlyDots | Out-Null
+          $noRelsNoBr = @($noRels | Where-Object { $_.Name -notmatch '\[' -and $_.Name -notmatch '\]' })
+          RunPack "T5_no_rels_no_bracket" $noRelsNoBr $true
 
-          "D_final (完整包，排除点开头文件)" | Out-File $sum -Append -Encoding UTF8
-          RunPack "D_final" $noDots | Out-Null
+          RunPack "T6_full_control" $alpha $false
 
           "=== end ===" | Out-File $sum -Append -Encoding UTF8
           Get-Content $sum
@@ -144,9 +150,9 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout --orphan diag-logs 2>/dev/null || git checkout diag-logs
           git rm -r --cached . -q 2>/dev/null || true
-          [ -f s-dot.log ] && cp s-dot.log . || true
+          [ -f s-iso.log ] && cp s-iso.log . || true
           git add -f *.log 2>/dev/null || true
-          git commit -m "dot ${{ github.run_id }}" || echo "nothing"
+          git commit -m "iso ${{ github.run_id }}" || echo "nothing"
           git push -f origin diag-logs || echo "push failed"
       - name: Upload
         if: always()
@@ -161,6 +167,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: winapp-logs
-          path: s-dot.log
+          path: s-iso.log
           if-no-files-found: warn
           retention-days: 14
