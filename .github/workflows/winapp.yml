@@ -230,13 +230,32 @@ jobs:
           Copy-Item "$out\b.appx" "dist\bluefish.appx" -Force
           "ver=$v" | Out-File -Append $env:GITHUB_OUTPUT
           "mb=$mb" | Out-File -Append $env:GITHUB_OUTPUT
-      - uses: actions/upload-artifact@v4
+      - name: Publish to Release
+        if: success()
+        continue-on-error: true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "v1.0.$env:GITHUB_RUN_NUMBER"
+          Write-Host "creating release $tag"
+          gh release create $tag "dist\bluefish.appx" --title "1.0.$env:GITHUB_RUN_NUMBER.0" --notes "Auto-built from DeepSeek upstream" --clobber
+          if ($LASTEXITCODE -ne 0) { Write-Host "release create failed" }
+      - name: Cleanup old releases
         if: always()
-        with:
-          name: dsh-msix
-          path: dist/*
-          if-no-files-found: warn
-          retention-days: 7
+        continue-on-error: true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $keep = "v1.0.$env:GITHUB_RUN_NUMBER"
+          $tags = gh release list --limit 100 --json tagName --jq ".[].tagName"
+          foreach ($t in $tags) {
+            if ($t -and $t -ne $keep) {
+              Write-Host "deleting old release $t"
+              gh release delete $t --yes --cleanup-tag
+            }
+          }
       - name: Save hash
         if: success()
         shell: bash
@@ -254,7 +273,7 @@ jobs:
         if: success()
         shell: pwsh
         run: |
-          $runUrl = "https://github.com/Magic-Miku/deepseek-harness/actions/runs/${{ github.run_id }}"
+          $dlUrl = "https://github.com/Magic-Miku/deepseek-harness/releases/download/v1.0.${{ github.run_number }}/bluefish.appx"
           $L = @(
             "DeepSeek Harness 新包已构建完成。",
             "",
@@ -262,17 +281,19 @@ jobs:
             "大小: ${{ steps.pack.outputs.mb }} MB",
             "",
             "===== 第 1 步：下载 =====",
-            "打开下面的链接，拉到最底部，点 Artifacts 里的 dsh-msix 下载",
             "",
-            $runUrl,
+            "点这个链接（浏览器立即开始下载）：",
+            "",
+            $dlUrl,
             "",
             "===== 第 2 步：上传商店 =====",
+            "",
             "打开下面链接（直达蓝色大肥鱼页面）：",
             "https://partner.microsoft.com/zh-cn/dashboard/products/9PCP6XTPQJTG/overview",
             "",
             "然后：",
             "  1. 点右上角的【更新】按钮",
-            "  2. 上传解压出的 bluefish.appx",
+            "  2. 上传刚下载的 bluefish.appx",
             "  3. 提交认证（约 3 个工作日）",
             "",
             "-- GitHub Actions 自动发送"
@@ -292,12 +313,6 @@ jobs:
             "",
             "版本: 1.0.${{ github.run_number }}.0",
             "上游指纹: ${{ needs.check.outputs.hash }}",
-            "",
-            "常见原因:",
-            "  1. DeepSeek 改了安装包结构（文件数/目录变化）",
-            "  2. 下载中断或大小不符（已加校验，重跑通常能过）",
-            "  3. 安装未完成（已加轮询等待）",
-            "  4. makeappx 打包失败",
             "",
             "查看日志:",
             $runUrl,
