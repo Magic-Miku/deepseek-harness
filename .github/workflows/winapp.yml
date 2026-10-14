@@ -151,6 +151,7 @@ jobs:
                    Where-Object { $_.FullName -match "\\x64\\" } | Sort-Object FullName -Descending | Select-Object -First 1).FullName
           }
           if (-not (Test-Path $mk)) { throw "makeappx not found" }
+          Write-Host "makeappx = $mk"
           $v = "1.0.$env:GITHUB_RUN_NUMBER.0"
           $s = "C:\S"
           if (Test-Path $s) { Remove-Item $s -Recurse -Force -ErrorAction SilentlyContinue }
@@ -229,13 +230,38 @@ jobs:
             '</Package>'
           )
           [IO.File]::WriteAllText("$s\AppxManifest.xml", ($x -join "`n"), (New-Object Text.UTF8Encoding $false))
+          # ---- 生成 resources.pri（官方要求：使用 targetsize/unplated 限定符资产时必须生成）----
+          $priOk = $false
+          $mp = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makepri.exe"
+          if (-not (Test-Path $mp)) {
+            $mp = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Filter makepri.exe -Recurse -ErrorAction SilentlyContinue |
+                   Where-Object { $_.FullName -match "\\x64\\" } | Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          }
+          if ($mp -and (Test-Path $mp)) {
+            Write-Host "makepri = $mp"
+            & $mp createconfig /cf "$s\priconfig.xml" /dq lang-en-US /o 2>&1 | Write-Host
+            & $mp new /pr $s /cf "$s\priconfig.xml" /mn "$s\AppxManifest.xml" /of "$s\resources.pri" /o 2>&1 | Write-Host
+            if (Test-Path "$s\resources.pri") {
+              $priSize = (Get-Item "$s\resources.pri").Length
+              Write-Host "resources.pri generated: $priSize bytes"
+              if ($priSize -gt 1024) { $priOk = $true } else { Write-Host "WARNING: resources.pri suspiciously small" }
+            } else {
+              Write-Host "WARNING: resources.pri was NOT created"
+            }
+            Remove-Item "$s\priconfig.xml" -Force -ErrorAction SilentlyContinue
+          } else {
+            Write-Host "WARNING: makepri.exe not found on this runner"
+            Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Directory -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Host "   " $_.FullName }
+          }
+          Write-Host "=== pri=$priOk ==="
           $out = "C:\out"
           if (Test-Path $out) { Remove-Item $out -Recurse -Force -ErrorAction SilentlyContinue }
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           & $mk pack /d $s /p "$out\b.appx" /o 2>&1 | Tee-Object b.log
           if (-not (Test-Path "$out\b.appx")) { Get-Content b.log | Select-Object -Last 8; throw "pack failed" }
           $mb = [math]::Round((Get-Item "$out\b.appx").Length/1MB,1)
-          Write-Host "*** OK $mb MB ver=$v icons=$iconN ***"
+          Write-Host "*** OK $mb MB ver=$v icons=$iconN pri=$priOk ***"
           if ($mb -lt 100) { throw "too small: $mb MB" }
           if (Test-Path "dist") { Remove-Item "dist" -Recurse -Force -ErrorAction SilentlyContinue }
           New-Item -ItemType Directory -Force -Path "dist" | Out-Null
@@ -243,6 +269,7 @@ jobs:
           "ver=$v" | Out-File -Append $env:GITHUB_OUTPUT
           "mb=$mb" | Out-File -Append $env:GITHUB_OUTPUT
           "icons=$iconN" | Out-File -Append $env:GITHUB_OUTPUT
+          "pri=$priOk" | Out-File -Append $env:GITHUB_OUTPUT
       - name: Publish Release (latest)
         id: rel
         if: success()
@@ -259,7 +286,7 @@ jobs:
           gh release create $tag "dist\bluefish.appx" `
             --repo $repo `
             --title "蓝色大肥鱼 $v（最新）" `
-            --notes "版本: $v`nicons: ${{ steps.pack.outputs.icons }}`nfrom: DeepSeek upstream`nbuild: ${{ github.run_number }}"
+            --notes "版本: $v`nicons: ${{ steps.pack.outputs.icons }}`npri: ${{ steps.pack.outputs.pri }}`nfrom: DeepSeek upstream`nbuild: ${{ github.run_number }}"
           if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
           $url = "https://github.com/$repo/releases/download/$tag/bluefish.appx"
           Write-Host "DIRECT URL = $url"
@@ -299,7 +326,8 @@ jobs:
             "",
             "版本: 1.0.${{ github.run_number }}.0",
             "大小: ${{ steps.pack.outputs.mb }} MB",
-            "图标: ${{ steps.pack.outputs.icons }} 个（含全部 targetsize 三主题）",
+            "图标: ${{ steps.pack.outputs.icons }} 个",
+            "resources.pri: ${{ steps.pack.outputs.pri }}",
             "",
             "===== 第 1 步：下载 =====",
             "",
