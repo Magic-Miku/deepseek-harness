@@ -206,10 +206,7 @@ jobs:
             }
             $srcImg.Dispose()
           } else {
-            Write-Host "source.png not found, fallback to existing png"
-            $ic = "$env:GITHUB_WORKSPACE\.github\store-icons"
-            Get-ChildItem $ic -File -Filter *.png -ErrorAction SilentlyContinue |
-              ForEach-Object { Copy-Item $_.FullName (Join-Path $a $_.Name) -Force }
+            throw "source.png not found at $srcIcon"
           }
 
           $iconN = @(Get-ChildItem $a -Recurse -File -Force -ErrorAction SilentlyContinue).Count
@@ -341,32 +338,6 @@ jobs:
           "mb=$mb" | Out-File -Append $env:GITHUB_OUTPUT
           "icons=$iconN" | Out-File -Append $env:GITHUB_OUTPUT
           "pri=$priOk" | Out-File -Append $env:GITHUB_OUTPUT
-      - name: Cleanup old icons
-        if: always()
-        shell: bash
-        continue-on-error: true
-        run: |
-          # 构建完成后：删除 source.png 之外的所有图标，推回仓库
-          cd "$GITHUB_WORKSPACE"
-          git config user.name "bot"
-          git config user.email "bot@users.noreply.github.com"
-          deleted=0
-          for f in .github/store-icons/*; do
-            [ -e "$f" ] || continue
-            base=$(basename "$f")
-            if [ "$base" != "source.png" ]; then
-              git rm -q "$f" && deleted=$((deleted+1))
-            fi
-          done
-          echo "deleted icons: $deleted"
-          if [ "$deleted" -gt 0 ]; then
-            git commit -q -m "chore: remove obsolete icons, keep source.png only [skip ci]"
-            git pull --rebase --autostash origin master || echo "rebase failed"
-            git push || echo "push failed"
-            echo "pushed cleanup"
-          else
-            echo "nothing to delete"
-          fi
       - name: Publish Release (latest)
         id: rel
         if: success()
