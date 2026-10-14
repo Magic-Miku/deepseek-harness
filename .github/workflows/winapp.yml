@@ -44,6 +44,14 @@ jobs:
           else
             N="$LEN|$LM"
           fi
+          # 图标源与打包脚本也纳入指纹：
+          # 否则换 source.png 或改本工作流后，计划运行会判定“无更新”而跳过，
+          # 导致改动永远不生效（必须手动 force）。
+          ICON_HASH=$(sha256sum .github/store-icons/source.png 2>/dev/null | cut -c1-16)
+          [ -z "$ICON_HASH" ] && ICON_HASH="noicon"
+          WF_HASH=$(sha256sum .github/workflows/winapp.yml 2>/dev/null | cut -c1-16)
+          [ -z "$WF_HASH" ] && WF_HASH="nowf"
+          N="$N|$ICON_HASH|$WF_HASH"
           O=""
           [ -f .dsh-hash ] && O=$(cat .dsh-hash | tr -d '\r\n"')
           echo "current  = $N"
@@ -489,7 +497,7 @@ jobs:
         run: |
           # 修复1：只有发布真正成功才写指纹。
           # 若发布失败，指纹保持旧值 => 下次运行会重新构建并重试发布，
-          # 避免"构建成功但发布失败"的版本被永久跳过。
+          # 避免“构建成功但发布失败”的版本被永久跳过。
           git config user.name "bot"
           git config user.email "bot@users.noreply.github.com"
           echo "${{ needs.check.outputs.hash }}" > .dsh-hash
