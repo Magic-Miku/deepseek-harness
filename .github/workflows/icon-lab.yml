@@ -17,6 +17,9 @@ jobs:
       - name: Build icon lab packages
         run: |
           $ErrorActionPreference = "Stop"
+          $notes = New-Object System.Collections.ArrayList
+          function Note([string]$m) { Write-Host $m; [void]$notes.Add($m) }
+
           Add-Type -AssemblyName System.Drawing
           $PNG = [System.Drawing.Imaging.ImageFormat]::Png
 
@@ -29,12 +32,11 @@ jobs:
           $mk = Find-Sdk "makeappx.exe"
           $mp = Find-Sdk "makepri.exe"
           $st = Find-Sdk "signtool.exe"
-          Write-Host "makeappx = $mk"
-          Write-Host "makepri  = $mp"
-          Write-Host "signtool = $st"
+          Note ("makeappx = " + $mk)
+          Note ("makepri  = " + $mp)
+          Note ("signtool = " + $st)
           if (-not $mk) { throw "makeappx not found" }
           if (-not $mp) { throw "makepri not found" }
-          if (-not $st) { throw "signtool not found" }
 
           $publisher = "CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD"
 
@@ -96,12 +98,12 @@ jobs:
             [pscustomobject]@{ Id="MagicMiku.IconLabC"; Label="C"; Name="Icon Lab C"; R=55;  G=85;  B=235; Padded=$false; Full=$true;  Pri=$true  }
           )
 
+          # ---------- phase 1: build variant folders ----------
           foreach ($v in $variants) {
             $dir = Join-Path $out $v.Label
             $ast = Join-Path $dir "Assets"
             New-Item -ItemType Directory -Force -Path $ast | Out-Null
             $col = [System.Drawing.Color]::FromArgb([int]$v.R, [int]$v.G, [int]$v.B)
-
             foreach ($b in $bases) {
               Draw-Icon -Path (Join-Path $ast ($b[0] + ".png")) -W ([int]$b[1]) -H ([int]$b[2]) -Color $col -Label $v.Label -Padded ([bool]$v.Padded)
             }
@@ -112,7 +114,6 @@ jobs:
                 }
               }
             }
-
             Copy-Item "C:\Windows\System32\cmd.exe" (Join-Path $dir "IconLab.exe") -Force
 
             $xml = @(
@@ -150,57 +151,60 @@ jobs:
               & $mp createconfig /cf (Join-Path $dir "priconfig.xml") /dq lang-en-US /o | Out-Null
               & $mp new /pr $dir /cf (Join-Path $dir "priconfig.xml") /mn (Join-Path $dir "AppxManifest.xml") /of (Join-Path $dir "resources.pri") /o | Out-Null
               if (-not (Test-Path (Join-Path $dir "resources.pri"))) { throw "pri failed for $($v.Label)" }
-              Write-Host ("{0}: pri  = {1} B" -f $v.Label, (Get-Item (Join-Path $dir "resources.pri")).Length)
+              Note ("{0}: pri = {1} B" -f $v.Label, (Get-Item (Join-Path $dir "resources.pri")).Length)
               Remove-Item (Join-Path $dir "priconfig.xml") -Force -ErrorAction SilentlyContinue
             }
-            Write-Host ("{0}: files = {1}" -f $v.Label, (Get-ChildItem $dir -Recurse -File).Count)
+            Note ("{0}: files = {1}  icons = {2}" -f $v.Label, (Get-ChildItem $dir -Recurse -File).Count, (Get-ChildItem $ast -File).Count)
           }
 
-          Write-Host ""
-          Write-Host "=== create self-signed code signing certificate ==="
-          $pwPlain = "IconLab!" + [Guid]::NewGuid().ToString("N").Substring(0, 8)
-          $sec = ConvertTo-SecureString $pwPlain -AsPlainText -Force
-          $cert = New-SelfSignedCertificate `
-            -Type CodeSigningCert `
-            -Subject $publisher `
-            -FriendlyName "Icon Lab Test" `
-            -KeyUsage DigitalSignature `
-            -KeyAlgorithm RSA `
-            -KeyLength 2048 `
-            -CertStoreLocation "Cert:\CurrentUser\My" `
-            -NotAfter (Get-Date).AddYears(5)
-          Write-Host ("thumbprint = {0}" -f $cert.Thumbprint)
-          Write-Host ("subject    = {0}" -f $cert.Subject)
+          # ---------- phase 2: loose zips (guaranteed, no signing needed) ----------
+          Note ""
+          Note "=== loose zips (primary, no certificate needed) ==="
+          foreach ($v in $variants) {
+            $zip = Join-Path $out ("Loose" + $v.Label + ".zip")
+            Compress-Archive -Path (Join-Path (Join-Path $out $v.Label) "*") -DestinationPath $zip -Force
+            Note ("{0}: loose = {1:N1} KB" -f $v.Label, ((Get-Item $zip).Length / 1KB))
+          }
 
-          $cerPath = Join-Path $out "IconLab.cer"
-          $pfxPath = Join-Path $out "IconLab.pfx"
-          Export-Certificate -Cert $cert -FilePath $cerPath -Type CERT | Out-Null
-          Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $sec -CryptoAlgorithmOption AES256_SHA256 | Out-Null
-
-          Write-Host ""
-          Write-Host "=== sign packages ==="
+          # ---------- phase 3: unsigned appx (for reference) ----------
+          Note ""
+          Note "=== unsigned appx ==="
           foreach ($v in $variants) {
             $src = Join-Path $out ($v.Label + ".appx")
             & $mk pack /d (Join-Path $out $v.Label) /p $src /o | Out-Null
-            if (-not (Test-Path $src)) { throw "pack failed for $($v.Label)" }
-            & $st sign /fd SHA256 /f $pfxPath /p $pwPlain /tr http://timestamp.digicert.com /td SHA256 $src | Write-Host
-            if ($LASTEXITCODE -ne 0) {
-              Write-Host "timestamp failed, retry without timestamp"
-              & $st sign /fd SHA256 /f $pfxPath /p $pwPlain $src | Write-Host
+            if (Test-Path $src) { Note ("{0}: appx = {1:N1} KB" -f $v.Label, ((Get-Item $src).Length / 1KB)) }
+            else { Note ("{0}: appx FAILED" -f $v.Label) }
+          }
+
+          # ---------- phase 4: self-sign (best effort, never fails the job) ----------
+          Note ""
+          Note "=== self-sign (best effort) ==="
+          $signErr = ""
+          try {
+            if (-not $st) { throw "signtool.exe not found under $sdk" }
+            $pwPlain = "IconLab!" + [Guid]::NewGuid().ToString("N").Substring(0, 8)
+            $sec = ConvertTo-SecureString $pwPlain -AsPlainText -Force
+            $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $publisher `
+              -CertStoreLocation "Cert:\CurrentUser\My" -NotAfter (Get-Date).AddYears(5)
+            Note ("cert subject = " + $cert.Subject)
+            $cerPath = Join-Path $out "IconLab.cer"
+            $pfxPath = Join-Path $out "IconLab.pfx"
+            Export-Certificate -Cert $cert -FilePath $cerPath | Out-Null
+            Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $sec | Out-Null
+            foreach ($v in $variants) {
+              $src = Join-Path $out ($v.Label + ".appx")
+              if (-not (Test-Path $src)) { continue }
+              & $st sign /fd SHA256 /f $pfxPath /p $pwPlain $src 2>&1 | Out-String | Write-Host
+              if ($LASTEXITCODE -eq 0) { Note ("{0}: signed OK" -f $v.Label) }
+              else { Note ("{0}: sign FAILED (exit {1})" -f $v.Label, $LASTEXITCODE) }
             }
-            $sig = & $st verify /pa $src 2>&1 | Out-String
-            Write-Host ("{0}: signed = {1}  ({2:N1} KB)" -f $v.Label, ($LASTEXITCODE -eq 0), ((Get-Item $src).Length / 1KB))
-          }
-          Remove-Item $pfxPath -Force -ErrorAction SilentlyContinue
-
-          Write-Host ""
-          Write-Host "=== loose zips (no signing needed, use -Register) ==="
-          foreach ($v in $variants) {
-            $zip = Join-Path $out ("Loose" + $v.Label + ".zip")
-            Compress-Archive -Path (Join-Path $out $v.Label "*") -DestinationPath $zip -Force
-            Write-Host ("{0}: loose = {1:N1} KB" -f $v.Label, ((Get-Item $zip).Length / 1KB))
+            Remove-Item $pfxPath -Force -ErrorAction SilentlyContinue
+          } catch {
+            $signErr = $_.Exception.Message
+            Note ("sign phase error: " + $signErr)
           }
 
+          # ---------- phase 5: README ----------
           $readme = @(
             'ICON LAB',
             '',
@@ -210,15 +214,14 @@ jobs:
             '  C = full-bleed opaque icon + 42 targetsize assets + resources.pri',
             '',
             '========== METHOD 1: double-click (needs the certificate once) ==========',
-            '  1. Double-click IconLab.cer',
-            '  2. Click "Install Certificate..."',
-            '  3. Store location: Local Machine   -> Next   (needs admin)',
-            '  4. "Place all certificates in the following store" -> Browse',
-            '  5. Choose "Trusted People"  (or "Trusted Root Certification Authorities")',
-            '  6. OK -> Next -> Finish -> security warning -> Yes',
-            '  7. Now double-click A.appx, B.appx, C.appx to install each.',
+            '  Only works if IconLab.cer is present in this artifact.',
+            '  1. Double-click IconLab.cer -> Install Certificate',
+            '  2. Store location: Local Machine -> Next (needs admin)',
+            '  3. "Place all certificates in the following store" -> Browse',
+            '  4. Choose "Trusted People" -> OK -> Next -> Finish -> Yes',
+            '  5. Now double-click A.appx / B.appx / C.appx to install each.',
             '',
-            '========== METHOD 2: no certificate needed ==========',
+            '========== METHOD 2: no certificate needed (always works) ==========',
             '  Unzip LooseA.zip / LooseB.zip / LooseC.zip, then in an ADMIN PowerShell:',
             '    Add-AppxPackage -Register "<folder>\A\AppxManifest.xml"',
             '    Add-AppxPackage -Register "<folder>\B\AppxManifest.xml"',
@@ -234,15 +237,19 @@ jobs:
             '  Get-AppxPackage MagicMiku.IconLabA | Remove-AppxPackage',
             '  Get-AppxPackage MagicMiku.IconLabB | Remove-AppxPackage',
             '  Get-AppxPackage MagicMiku.IconLabC | Remove-AppxPackage',
-            '  (the certificate can stay; it is harmless and 5 years validity)'
+            '',
+            '========== BUILD NOTES =========='
           )
+          $readme = $readme + ($notes | ForEach-Object { "  " + $_ })
           $readme -join "`r`n" | Out-File -FilePath (Join-Path $out "README.txt") -Encoding UTF8
 
-          Write-Host ""
-          Write-Host "=== built ==="
+          Note ""
+          Note "=== built ==="
           Get-ChildItem $out -File | Sort-Object Name | ForEach-Object {
-            Write-Host ("  {0,-18} {1,10:N1} KB" -f $_.Name, ($_.Length / 1KB))
+            Note ("  {0,-18} {1,10:N1} KB" -f $_.Name, ($_.Length / 1KB))
           }
+          # never fail the job because of the optional signing
+          Write-Host "DONE"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
