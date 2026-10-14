@@ -40,6 +40,8 @@ jobs:
 
           $publisher = "CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD"
 
+          # 关键修复：startIndexAt="\"（索引整个包根，QQ/VLC 官方同款）
+          # 之前用 "Assets" 导致 makepri new 失败（pri 不生成、后续全断）
           $pricfgLines = @(
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
             '<resources targetOsVersion="10.0.0" majorVersion="1">',
@@ -48,7 +50,7 @@ jobs:
             '    <autoResourcePackage qualifier="Scale"/>',
             '    <autoResourcePackage qualifier="DXFeatureLevel"/>',
             '  </packaging>',
-            '  <index root="\" startIndexAt="Assets">',
+            '  <index root="\" startIndexAt="\">',
             '    <default>',
             '      <qualifier name="Language" value="en-US"/>',
             '      <qualifier name="Contrast" value="standard"/>',
@@ -139,11 +141,10 @@ jobs:
             }
             if ($v.Full) {
               foreach ($t in $tsizes) {
-                # 前缀用 Square44x44Logo（清单引用的名字），不用 AppList
+                # 关键修复：前缀用 Square44x44Logo（清单引用的名字），不用 AppList
                 Draw-Icon -Path (Join-Path $ast ("Square44x44Logo.targetsize-$t.png")) -W $t -H $t -Color $col -Label $v.Label -Padded $false
                 Draw-Icon -Path (Join-Path $ast ("Square44x44Logo.targetsize-$t`_altform-unplated.png")) -W $t -H $t -Color $col -Label $v.Label -Padded $false
                 Draw-Icon -Path (Join-Path $ast ("Square44x44Logo.targetsize-$t`_altform-lightunplated.png")) -W $t -H $t -Color $col -Label $v.Label -Padded $false
-                # 顺带也生成 altform 在前的变体（QQ 用的顺序）
                 Draw-Icon -Path (Join-Path $ast ("Square44x44Logo.altform-unplated_targetsize-$t.png")) -W $t -H $t -Color $col -Label $v.Label -Padded $false
                 Draw-Icon -Path (Join-Path $ast ("Square44x44Logo.altform-lightunplated_targetsize-$t.png")) -W $t -H $t -Color $col -Label $v.Label -Padded $false
               }
@@ -184,17 +185,23 @@ jobs:
             if ($v.Pri) {
               $cfgPath = Join-Path $dir "priconfig.xml"
               [IO.File]::WriteAllText($cfgPath, ($pricfgLines -join "`n"), (New-Object Text.UTF8Encoding $false))
-              & $mp new /pr $dir /cf $cfgPath /mn (Join-Path $dir "AppxManifest.xml") /of (Join-Path $dir "resources.pri") /o | Out-Null
-              if (-not (Test-Path (Join-Path $dir "resources.pri"))) { throw "pri failed for $($v.Label)" }
               $priPath = Join-Path $dir "resources.pri"
-              $priBytes = [IO.File]::ReadAllBytes($priPath)
-              $priTxt = [Text.Encoding]::Unicode.GetString($priBytes)
-              Note ("{0}: pri = {1} B  TargetSize={2}  Scale={3}  Square44x44Logo={4}" -f $v.Label,
-                    $priBytes.Length,
-                    $priTxt.Contains("TargetSize"),
-                    $priTxt.Contains("Scale"),
-                    $priTxt.Contains("Square44x44Logo"))
-              Remove-Item $cfgPath -Force -ErrorAction SilentlyContinue
+              $priLog = & $mp new /pr $dir /cf $cfgPath /mn (Join-Path $dir "AppxManifest.xml") /of $priPath /o 2>&1 | Out-String
+              Note ("{0}: makepri output:" -f $v.Label)
+              $priLog -split "`n" | ForEach-Object { if ($_.Trim()) { Note ("      " + $_.Trim()) } }
+              if (-not (Test-Path $priPath)) {
+                Note ("{0}: *** PRI NOT CREATED ***" -f $v.Label)
+              } else {
+                $priBytes = [IO.File]::ReadAllBytes($priPath)
+                $priTxt = [Text.Encoding]::Unicode.GetString($priBytes)
+                Note ("{0}: pri = {1} B  TargetSize={2}  Scale={3}  Theme={4}  Square44x44Logo={5}" -f $v.Label,
+                      $priBytes.Length,
+                      $priTxt.Contains("TargetSize"),
+                      $priTxt.Contains("Scale"),
+                      $priTxt.Contains("Theme"),
+                      $priTxt.Contains("Square44x44Logo"))
+                Remove-Item $cfgPath -Force -ErrorAction SilentlyContinue
+              }
             }
             Note ("{0}: files = {1}  icons = {2}" -f $v.Label, (Get-ChildItem $dir -Recurse -File).Count, (Get-ChildItem $ast -File).Count)
           }
