@@ -163,30 +163,68 @@ jobs:
           $staged = @(Get-ChildItem $s -Recurse -File -Force -ErrorAction SilentlyContinue)
           Write-Host "staged = $($staged.Count)"
           if ($staged.Count -lt 9000) { throw "staging incomplete: $($staged.Count)" }
+
+          # ================= 图标：从 source.png 现生成 =================
           $a = "$s\Assets"
           New-Item -ItemType Directory -Force -Path $a | Out-Null
-          $ic = "$env:GITHUB_WORKSPACE\.github\store-icons"
-          $zip = Join-Path $ic "appx-icons.zip"
-          if (Test-Path $zip) {
-            Expand-Archive -Path $zip -DestinationPath $a -Force
-            Write-Host "icons extracted from appx-icons.zip"
+          $srcIcon = "$env:GITHUB_WORKSPACE\.github\store-icons\source.png"
+          if (Test-Path $srcIcon) {
+            Write-Host "generating icons from source.png"
+            Add-Type -AssemblyName System.Drawing
+            $srcImg = [System.Drawing.Image]::FromFile($srcIcon)
+            Write-Host ("source: {0}x{1}" -f $srcImg.Width, $srcImg.Height)
+            function New-Icon([string]$Path, [int]$W, [int]$H) {
+              $bmp = New-Object System.Drawing.Bitmap($W, $H)
+              $g = [System.Drawing.Graphics]::FromImage($bmp)
+              $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+              $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+              $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+              $sw = $srcImg.Width; $sh = $srcImg.Height
+              $scale = [Math]::Max($W / [double]$sw, $H / [double]$sh)
+              $nw = [Math]::Max($W, [int][Math]::Round($sw * $scale))
+              $nh = [Math]::Max($H, [int][Math]::Round($sh * $scale))
+              $left = [int](($nw - $W) / 2); $top = [int](($nh - $H) / 2)
+              $dstRect = New-Object System.Drawing.Rectangle(-$left, -$top, $nw, $nh)
+              $g.Clear([System.Drawing.Color]::White)
+              $g.DrawImage($srcImg, $dstRect)
+              $g.Dispose()
+              $bmp.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
+              $bmp.Dispose()
+            }
+            New-Icon (Join-Path $a "StoreLogo.png")          50  50
+            New-Icon (Join-Path $a "Square44x44Logo.png")    44  44
+            New-Icon (Join-Path $a "Square71x71Logo.png")    71  71
+            New-Icon (Join-Path $a "Square150x150Logo.png")  150 150
+            New-Icon (Join-Path $a "Square310x310Logo.png")  310 310
+            New-Icon (Join-Path $a "Wide310x150Logo.png")    310 150
+            New-Icon (Join-Path $a "SplashScreen.png")       620 300
+            New-Icon (Join-Path $a "BadgeLogo.png")          24  24
+            foreach ($t in @(24, 48, 64, 256)) {
+              foreach ($suf in @("", "_altform-unplated", "_altform-lightunplated")) {
+                New-Icon (Join-Path $a ("Square44x44Logo.targetsize-$t$suf.png")) $t $t
+              }
+            }
+            $srcImg.Dispose()
           } else {
+            Write-Host "source.png not found, fallback to existing png"
+            $ic = "$env:GITHUB_WORKSPACE\.github\store-icons"
             Get-ChildItem $ic -File -Filter *.png -ErrorAction SilentlyContinue |
               ForEach-Object { Copy-Item $_.FullName (Join-Path $a $_.Name) -Force }
-            Write-Host "icons copied from individual png files"
           }
+
           $iconN = @(Get-ChildItem $a -Recurse -File -Force -ErrorAction SilentlyContinue).Count
           Write-Host "icons = $iconN"
-          if ($iconN -lt 40) { throw "too few icons: $iconN (expected >=40)" }
-          $need = @("StoreLogo.png","Square44x44Logo.png","Square150x150Logo.png","Square310x310Logo.png","Square71x71Logo.png","Wide310x150Logo.png","SplashScreen.png","BadgeLogo.png","AppList.png")
+          if ($iconN -lt 15) { throw "too few icons: $iconN (expected >=15)" }
+          $need = @("StoreLogo.png","Square44x44Logo.png","Square150x150Logo.png","Square310x310Logo.png","Square71x71Logo.png","Wide310x150Logo.png","SplashScreen.png","BadgeLogo.png")
           foreach ($n in $need) { if (-not (Test-Path (Join-Path $a $n))) { throw "required icon missing: $n" } }
-          foreach ($t in @(16,20,24,30,32,36,40,48,60,64,72,80,96,256)) {
+          foreach ($t in @(24,48,64,256)) {
             foreach ($suf in @("","_altform-unplated","_altform-lightunplated")) {
-              $fn = "AppList.targetsize-$t$suf.png"
-              if (-not (Test-Path (Join-Path $a $fn))) { throw "AppList targetsize asset missing: $fn" }
+              $fn = "Square44x44Logo.targetsize-$t$suf.png"
+              if (-not (Test-Path (Join-Path $a $fn))) { throw "targetsize asset missing: $fn" }
             }
           }
-          Write-Host "all required AppList targetsize assets present (14 sizes x 3 themes)"
+          Write-Host "all required icon assets present (8 base + 12 targetsize)"
+
           $pdn = [char]0xD835 + [char]0xDD78 + 'ik' + [char]0x0E19 + [char]0x795E + [char]0x6559 + [char]0x2728 + [char]0x6559 + [char]0x4E3B
           $x = @(
             '<?xml version="1.0" encoding="utf-8"?>'
@@ -230,7 +268,8 @@ jobs:
             '</Package>'
           )
           [IO.File]::WriteAllText("$s\AppxManifest.xml", ($x -join "`n"), (New-Object Text.UTF8Encoding $false))
-          # ---- 生成 resources.pri（官方要求：使用 targetsize/unplated 限定符资产时必须生成）----
+
+          # ================= 生成 resources.pri（targetsize 靠它索引） =================
           $priOk = $false
           $mp = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makepri.exe"
           if (-not (Test-Path $mp)) {
@@ -238,23 +277,55 @@ jobs:
                    Where-Object { $_.FullName -match "\\x64\\" } | Sort-Object FullName -Descending | Select-Object -First 1).FullName
           }
           if ($mp -and (Test-Path $mp)) {
-            Write-Host "makepri = $mp"
-            & $mp createconfig /cf "$s\priconfig.xml" /dq lang-en-US /o 2>&1 | Write-Host
-            & $mp new /pr $s /cf "$s\priconfig.xml" /mn "$s\AppxManifest.xml" /of "$s\resources.pri" /o 2>&1 | Write-Host
-            if (Test-Path "$s\resources.pri") {
-              $priSize = (Get-Item "$s\resources.pri").Length
-              Write-Host "resources.pri generated: $priSize bytes"
-              if ($priSize -gt 1024) { $priOk = $true } else { Write-Host "WARNING: resources.pri suspiciously small" }
+            $pricfgLines = @(
+              '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+              '<resources targetOsVersion="10.0.0" majorVersion="1">',
+              '  <packaging>',
+              '    <autoResourcePackage qualifier="Language"/>',
+              '    <autoResourcePackage qualifier="Scale"/>',
+              '    <autoResourcePackage qualifier="DXFeatureLevel"/>',
+              '  </packaging>',
+              '  <index root="\" startIndexAt="\">',
+              '    <default>',
+              '      <qualifier name="Language" value="en-US"/>',
+              '      <qualifier name="Contrast" value="standard"/>',
+              '      <qualifier name="Scale" value="100"/>',
+              '      <qualifier name="HomeRegion" value="001"/>',
+              '      <qualifier name="TargetSize" value="256"/>',
+              '      <qualifier name="LayoutDirection" value="LTR"/>',
+              '      <qualifier name="Theme" value="dark"/>',
+              '      <qualifier name="AlternateForm" value=""/>',
+              '      <qualifier name="DXFeatureLevel" value="DX9"/>',
+              '      <qualifier name="Configuration" value=""/>',
+              '      <qualifier name="DeviceFamily" value="Universal"/>',
+              '      <qualifier name="Custom" value=""/>',
+              '    </default>',
+              '    <indexer-config type="folder" foldernameAsQualifier="true" filenameAsQualifier="true" qualifierDelimiter="."/>',
+              '    <indexer-config type="resw" convertDotsToSlashes="true" initialPath=""/>',
+              '    <indexer-config type="resjson" initialPath=""/>',
+              '    <indexer-config type="PRI"/>',
+              '  </index>',
+              '</resources>'
+            )
+            $cfgPath = "$s\priconfig.xml"
+            [IO.File]::WriteAllText($cfgPath, ($pricfgLines -join "`n"), (New-Object Text.UTF8Encoding $false))
+            $priPath = "$s\resources.pri"
+            $priLog = & $mp new /pr $s /cf $cfgPath /mn "$s\AppxManifest.xml" /of $priPath /o 2>&1 | Out-String
+            $cand = ($priLog -split "`n" | Where-Object { $_ -match "Resource Candidates" } | ForEach-Object { $_.Trim() }) -join " "
+            Write-Host "makepri: $cand"
+            if (-not (Test-Path $priPath)) {
+              Write-Host "WARNING: resources.pri NOT created"
+              $priLog -split "`n" | ForEach-Object { if ($_.Trim()) { Write-Host "   " + $_.Trim() } }
             } else {
-              Write-Host "WARNING: resources.pri was NOT created"
+              $priOk = $true
+              Write-Host "resources.pri = $((Get-Item $priPath).Length) bytes"
+              Remove-Item $cfgPath -Force -ErrorAction SilentlyContinue
             }
-            Remove-Item "$s\priconfig.xml" -Force -ErrorAction SilentlyContinue
           } else {
-            Write-Host "WARNING: makepri.exe not found on this runner"
-            Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Directory -ErrorAction SilentlyContinue |
-              ForEach-Object { Write-Host "   " $_.FullName }
+            Write-Host "WARNING: makepri.exe not found"
           }
           Write-Host "=== pri=$priOk ==="
+
           $out = "C:\out"
           if (Test-Path $out) { Remove-Item $out -Recurse -Force -ErrorAction SilentlyContinue }
           New-Item -ItemType Directory -Force -Path $out | Out-Null
@@ -270,6 +341,32 @@ jobs:
           "mb=$mb" | Out-File -Append $env:GITHUB_OUTPUT
           "icons=$iconN" | Out-File -Append $env:GITHUB_OUTPUT
           "pri=$priOk" | Out-File -Append $env:GITHUB_OUTPUT
+      - name: Cleanup old icons
+        if: always()
+        shell: bash
+        continue-on-error: true
+        run: |
+          # 构建完成后：删除 source.png 之外的所有图标，推回仓库
+          cd "$GITHUB_WORKSPACE"
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+          deleted=0
+          for f in .github/store-icons/*; do
+            [ -e "$f" ] || continue
+            base=$(basename "$f")
+            if [ "$base" != "source.png" ]; then
+              git rm -q "$f" && deleted=$((deleted+1))
+            fi
+          done
+          echo "deleted icons: $deleted"
+          if [ "$deleted" -gt 0 ]; then
+            git commit -q -m "chore: remove obsolete icons, keep source.png only [skip ci]"
+            git pull --rebase --autostash origin master || echo "rebase failed"
+            git push || echo "push failed"
+            echo "pushed cleanup"
+          else
+            echo "nothing to delete"
+          fi
       - name: Publish Release (latest)
         id: rel
         if: success()
@@ -326,7 +423,7 @@ jobs:
             "",
             "版本: 1.0.${{ github.run_number }}.0",
             "大小: ${{ steps.pack.outputs.mb }} MB",
-            "图标: ${{ steps.pack.outputs.icons }} 个",
+            "图标: ${{ steps.pack.outputs.icons }} 个（source.png 现生成）",
             "resources.pri: ${{ steps.pack.outputs.pri }}",
             "",
             "===== 第 1 步：下载 =====",
@@ -368,7 +465,7 @@ jobs:
             "  2. 下载中断或大小不符",
             "  3. 安装未完成",
             "  4. makeappx 打包失败",
-            "  5. 图标缺失（.github/store-icons/）",
+            "  5. 图标生成失败（source.png 缺失或损坏）",
             "",
             "查看日志:",
             $runUrl,
