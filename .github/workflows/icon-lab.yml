@@ -40,7 +40,6 @@ jobs:
 
           $publisher = "CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD"
 
-          # ---------- 官方完整 priconfig（用数组写，避免 here-string 破坏 YAML） ----------
           $pricfgLines = @(
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
             '<resources targetOsVersion="10.0.0" majorVersion="1">',
@@ -127,7 +126,7 @@ jobs:
           $variants = @(
             [pscustomobject]@{ Id="MagicMiku.IconLabA"; Label="A"; Name="Icon Lab A"; R=225; G=45;  B=45;  Padded=$false; Full=$false; Pri=$false },
             [pscustomobject]@{ Id="MagicMiku.IconLabB"; Label="B"; Name="Icon Lab B"; R=40;  G=175; B=70;  Padded=$true;  Full=$false; Pri=$false },
-            [pscustomobject]@{ Id="MagicMiku.IconLabC"; Label="C"; Name="Icon Lab C"; R=55;  G=85;  B=235; Padded=$false; Full=$true;  Pri=$true  }
+            [pscustomobject]@{ Id="MagicMiku.IconLabD"; Label="D"; Name="Icon Lab D"; R=55;  G=85;  B=235; Padded=$false; Full=$true;  Pri=$true  }
           )
 
           foreach ($v in $variants) {
@@ -140,9 +139,13 @@ jobs:
             }
             if ($v.Full) {
               foreach ($t in $tsizes) {
-                foreach ($suf in @("", "_altform-unplated", "_altform-lightunplated")) {
-                  Draw-Icon -Path (Join-Path $ast ("AppList.targetsize-$t$suf.png")) -W $t -H $t -Color $col -Label $v.Label -Padded $false
-                }
+                # 前缀用 Square44x44Logo（清单引用的名字），不用 AppList
+                Draw-Icon -Path (Join-Path $ast ("Square44x44Logo.targetsize-$t.png")) -W $t -H $t -Color $col -Label $v.Label -Padded $false
+                Draw-Icon -Path (Join-Path $ast ("Square44x44Logo.targetsize-$t`_altform-unplated.png")) -W $t -H $t -Color $col -Label $v.Label -Padded $false
+                Draw-Icon -Path (Join-Path $ast ("Square44x44Logo.targetsize-$t`_altform-lightunplated.png")) -W $t -H $t -Color $col -Label $v.Label -Padded $false
+                # 顺带也生成 altform 在前的变体（QQ 用的顺序）
+                Draw-Icon -Path (Join-Path $ast ("Square44x44Logo.altform-unplated_targetsize-$t.png")) -W $t -H $t -Color $col -Label $v.Label -Padded $false
+                Draw-Icon -Path (Join-Path $ast ("Square44x44Logo.altform-lightunplated_targetsize-$t.png")) -W $t -H $t -Color $col -Label $v.Label -Padded $false
               }
             }
             Copy-Item "C:\Windows\System32\cmd.exe" (Join-Path $dir "IconLab.exe") -Force
@@ -186,11 +189,11 @@ jobs:
               $priPath = Join-Path $dir "resources.pri"
               $priBytes = [IO.File]::ReadAllBytes($priPath)
               $priTxt = [Text.Encoding]::Unicode.GetString($priBytes)
-              Note ("{0}: pri = {1} B  TargetSize={2}  Theme={3}  Scale={4}" -f $v.Label,
+              Note ("{0}: pri = {1} B  TargetSize={2}  Scale={3}  Square44x44Logo={4}" -f $v.Label,
                     $priBytes.Length,
                     $priTxt.Contains("TargetSize"),
-                    $priTxt.Contains("Theme"),
-                    $priTxt.Contains("Scale"))
+                    $priTxt.Contains("Scale"),
+                    $priTxt.Contains("Square44x44Logo"))
               Remove-Item $cfgPath -Force -ErrorAction SilentlyContinue
             }
             Note ("{0}: files = {1}  icons = {2}" -f $v.Label, (Get-ChildItem $dir -Recurse -File).Count, (Get-ChildItem $ast -File).Count)
@@ -243,30 +246,30 @@ jobs:
             '',
             '  A = full-bleed opaque icon, NO targetsize assets, no resources.pri',
             '  B = transparent + padded icon, NO targetsize assets, no resources.pri',
-            '  C = full-bleed opaque icon + 42 targetsize assets + resources.pri (full qualifier set)',
+            '  D = full-bleed opaque icon + Square44x44Logo.targetsize-* + resources.pri',
             '',
             '========== METHOD 1: double-click (needs the certificate once) ==========',
             '  1. Double-click IconLab.cer -> Install Certificate',
             '  2. Store location: Local Machine -> Next (needs admin)',
             '  3. "Place all certificates in the following store" -> Browse',
             '  4. Choose "Trusted People" -> OK -> Next -> Finish -> Yes',
-            '  5. Now double-click A.appx / B.appx / C.appx to install each.',
+            '  5. Now double-click A.appx / B.appx / D.appx to install each.',
             '',
             '========== METHOD 2: no certificate needed (always works) ==========',
-            '  Unzip LooseA.zip / LooseB.zip / LooseC.zip, then in an ADMIN PowerShell:',
+            '  Unzip LooseA.zip / LooseB.zip / LooseD.zip, then in an ADMIN PowerShell:',
             '    Add-AppxPackage -Register "<folder>\A\AppxManifest.xml"',
             '    Add-AppxPackage -Register "<folder>\B\AppxManifest.xml"',
-            '    Add-AppxPackage -Register "<folder>\C\AppxManifest.xml"',
+            '    Add-AppxPackage -Register "<folder>\D\AppxManifest.xml"',
             '',
             '========== WHAT TO CHECK ==========',
-            '  Pin A, B, C to the taskbar and compare:',
+            '  Pin A, B, D to the taskbar and compare:',
             '    full bleed -> colour fills the whole square, edge to edge, no plate',
             '    plated     -> small shape centred on a coloured background plate',
             '',
             '========== UNINSTALL ==========',
             '  Get-AppxPackage MagicMiku.IconLabA | Remove-AppxPackage',
             '  Get-AppxPackage MagicMiku.IconLabB | Remove-AppxPackage',
-            '  Get-AppxPackage MagicMiku.IconLabC | Remove-AppxPackage',
+            '  Get-AppxPackage MagicMiku.IconLabD | Remove-AppxPackage',
             '',
             '========== BUILD NOTES =========='
           )
