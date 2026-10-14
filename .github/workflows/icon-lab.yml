@@ -40,8 +40,6 @@ jobs:
 
           $publisher = "CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD"
 
-          # 关键修复：startIndexAt="\"（索引整个包根，QQ/VLC 官方同款）
-          # 之前用 "Assets" 导致 makepri new 失败（pri 不生成、后续全断）
           $pricfgLines = @(
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
             '<resources targetOsVersion="10.0.0" majorVersion="1">',
@@ -141,12 +139,11 @@ jobs:
             }
             if ($v.Full) {
               foreach ($t in $tsizes) {
-                # 关键修复：前缀用 Square44x44Logo（清单引用的名字），不用 AppList
+                # 只保留一种顺序：targetsize 在前（VLC 同款）
+                # 之前两种顺序都会报 Duplicate Entry
                 Draw-Icon -Path (Join-Path $ast ("Square44x44Logo.targetsize-$t.png")) -W $t -H $t -Color $col -Label $v.Label -Padded $false
                 Draw-Icon -Path (Join-Path $ast ("Square44x44Logo.targetsize-$t`_altform-unplated.png")) -W $t -H $t -Color $col -Label $v.Label -Padded $false
                 Draw-Icon -Path (Join-Path $ast ("Square44x44Logo.targetsize-$t`_altform-lightunplated.png")) -W $t -H $t -Color $col -Label $v.Label -Padded $false
-                Draw-Icon -Path (Join-Path $ast ("Square44x44Logo.altform-unplated_targetsize-$t.png")) -W $t -H $t -Color $col -Label $v.Label -Padded $false
-                Draw-Icon -Path (Join-Path $ast ("Square44x44Logo.altform-lightunplated_targetsize-$t.png")) -W $t -H $t -Color $col -Label $v.Label -Padded $false
               }
             }
             Copy-Item "C:\Windows\System32\cmd.exe" (Join-Path $dir "IconLab.exe") -Force
