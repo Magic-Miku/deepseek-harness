@@ -148,11 +148,48 @@ jobs:
             [IO.File]::WriteAllText((Join-Path $dir "AppxManifest.xml"), ($xml -join "`n"), (New-Object Text.UTF8Encoding $false))
 
             if ($v.Pri) {
-              & $mp createconfig /cf (Join-Path $dir "priconfig.xml") /dq lang-en-US /o | Out-Null
-              & $mp new /pr $dir /cf (Join-Path $dir "priconfig.xml") /mn (Join-Path $dir "AppxManifest.xml") /of (Join-Path $dir "resources.pri") /o | Out-Null
+              $pricfg = @'
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<resources targetOsVersion="10.0.0" majorVersion="1">
+  <packaging>
+    <autoResourcePackage qualifier="Language"/>
+    <autoResourcePackage qualifier="Scale"/>
+    <autoResourcePackage qualifier="DXFeatureLevel"/>
+  </packaging>
+  <index root="\" startIndexAt="Assets">
+    <default>
+      <qualifier name="Language" value="en-US"/>
+      <qualifier name="Contrast" value="standard"/>
+      <qualifier name="Scale" value="100"/>
+      <qualifier name="HomeRegion" value="001"/>
+      <qualifier name="TargetSize" value="256"/>
+      <qualifier name="LayoutDirection" value="LTR"/>
+      <qualifier name="Theme" value="dark"/>
+      <qualifier name="AlternateForm" value=""/>
+      <qualifier name="DXFeatureLevel" value="DX9"/>
+      <qualifier name="Configuration" value=""/>
+      <qualifier name="DeviceFamily" value="Universal"/>
+      <qualifier name="Custom" value=""/>
+    </default>
+    <indexer-config type="folder" foldernameAsQualifier="true" filenameAsQualifier="true" qualifierDelimiter="."/>
+    <indexer-config type="resw" convertDotsToSlashes="true" initialPath=""/>
+    <indexer-config type="resjson" initialPath=""/>
+    <indexer-config type="PRI"/>
+  </index>
+</resources>
+'@
+              $cfgPath = Join-Path $dir "priconfig.xml"
+              [IO.File]::WriteAllText($cfgPath, $pricfg, (New-Object Text.UTF8Encoding $false))
+              & $mp new /pr $dir /cf $cfgPath /mn (Join-Path $dir "AppxManifest.xml") /of (Join-Path $dir "resources.pri") /o | Out-Null
               if (-not (Test-Path (Join-Path $dir "resources.pri"))) { throw "pri failed for $($v.Label)" }
-              Note ("{0}: pri = {1} B" -f $v.Label, (Get-Item (Join-Path $dir "resources.pri")).Length)
-              Remove-Item (Join-Path $dir "priconfig.xml") -Force -ErrorAction SilentlyContinue
+              $priPath = Join-Path $dir "resources.pri"
+              $priTxt = [Text.Encoding]::Unicode.GetString([IO.File]::ReadAllBytes($priPath))
+              Note ("{0}: pri = {1} B  TargetSize={2}  Theme={3}  Scale={4}" -f $v.Label,
+                    (Get-Item $priPath).Length,
+                    $priTxt.Contains("TargetSize"),
+                    $priTxt.Contains("Theme"),
+                    $priTxt.Contains("Scale"))
+              Remove-Item $cfgPath -Force -ErrorAction SilentlyContinue
             }
             Note ("{0}: files = {1}  icons = {2}" -f $v.Label, (Get-ChildItem $dir -Recurse -File).Count, (Get-ChildItem $ast -File).Count)
           }
@@ -211,10 +248,9 @@ jobs:
             'Three tiny standalone apps (different identities) so they can coexist:',
             '  A = full-bleed opaque icon, NO targetsize assets, no resources.pri',
             '  B = transparent + padded icon, NO targetsize assets, no resources.pri',
-            '  C = full-bleed opaque icon + 42 targetsize assets + resources.pri',
+            '  C = full-bleed opaque icon + 42 targetsize assets + resources.pri (full qualifier set)',
             '',
             '========== METHOD 1: double-click (needs the certificate once) ==========',
-            '  Only works if IconLab.cer is present in this artifact.',
             '  1. Double-click IconLab.cer -> Install Certificate',
             '  2. Store location: Local Machine -> Next (needs admin)',
             '  3. "Place all certificates in the following store" -> Browse',
@@ -248,7 +284,6 @@ jobs:
           Get-ChildItem $out -File | Sort-Object Name | ForEach-Object {
             Note ("  {0,-18} {1,10:N1} KB" -f $_.Name, ($_.Length / 1KB))
           }
-          # never fail the job because of the optional signing
           Write-Host "DONE"
       - uses: actions/upload-artifact@v4
         if: always()
