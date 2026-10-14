@@ -40,6 +40,38 @@ jobs:
 
           $publisher = "CN=527BE4FD-4A22-42F5-9566-91D9CFF8BFFD"
 
+          # ---------- 官方完整 priconfig（用数组写，避免 here-string 破坏 YAML） ----------
+          $pricfgLines = @(
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+            '<resources targetOsVersion="10.0.0" majorVersion="1">',
+            '  <packaging>',
+            '    <autoResourcePackage qualifier="Language"/>',
+            '    <autoResourcePackage qualifier="Scale"/>',
+            '    <autoResourcePackage qualifier="DXFeatureLevel"/>',
+            '  </packaging>',
+            '  <index root="\" startIndexAt="Assets">',
+            '    <default>',
+            '      <qualifier name="Language" value="en-US"/>',
+            '      <qualifier name="Contrast" value="standard"/>',
+            '      <qualifier name="Scale" value="100"/>',
+            '      <qualifier name="HomeRegion" value="001"/>',
+            '      <qualifier name="TargetSize" value="256"/>',
+            '      <qualifier name="LayoutDirection" value="LTR"/>',
+            '      <qualifier name="Theme" value="dark"/>',
+            '      <qualifier name="AlternateForm" value=""/>',
+            '      <qualifier name="DXFeatureLevel" value="DX9"/>',
+            '      <qualifier name="Configuration" value=""/>',
+            '      <qualifier name="DeviceFamily" value="Universal"/>',
+            '      <qualifier name="Custom" value=""/>',
+            '    </default>',
+            '    <indexer-config type="folder" foldernameAsQualifier="true" filenameAsQualifier="true" qualifierDelimiter="."/>',
+            '    <indexer-config type="resw" convertDotsToSlashes="true" initialPath=""/>',
+            '    <indexer-config type="resjson" initialPath=""/>',
+            '    <indexer-config type="PRI"/>',
+            '  </index>',
+            '</resources>'
+          )
+
           function Draw-Icon {
             param([string]$Path, [int]$W, [int]$H, $Color, [string]$Label, [bool]$Padded)
             $bmp = New-Object System.Drawing.Bitmap($W, $H)
@@ -98,7 +130,6 @@ jobs:
             [pscustomobject]@{ Id="MagicMiku.IconLabC"; Label="C"; Name="Icon Lab C"; R=55;  G=85;  B=235; Padded=$false; Full=$true;  Pri=$true  }
           )
 
-          # ---------- phase 1: build variant folders ----------
           foreach ($v in $variants) {
             $dir = Join-Path $out $v.Label
             $ast = Join-Path $dir "Assets"
@@ -148,44 +179,15 @@ jobs:
             [IO.File]::WriteAllText((Join-Path $dir "AppxManifest.xml"), ($xml -join "`n"), (New-Object Text.UTF8Encoding $false))
 
             if ($v.Pri) {
-              $pricfg = @'
-<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<resources targetOsVersion="10.0.0" majorVersion="1">
-  <packaging>
-    <autoResourcePackage qualifier="Language"/>
-    <autoResourcePackage qualifier="Scale"/>
-    <autoResourcePackage qualifier="DXFeatureLevel"/>
-  </packaging>
-  <index root="\" startIndexAt="Assets">
-    <default>
-      <qualifier name="Language" value="en-US"/>
-      <qualifier name="Contrast" value="standard"/>
-      <qualifier name="Scale" value="100"/>
-      <qualifier name="HomeRegion" value="001"/>
-      <qualifier name="TargetSize" value="256"/>
-      <qualifier name="LayoutDirection" value="LTR"/>
-      <qualifier name="Theme" value="dark"/>
-      <qualifier name="AlternateForm" value=""/>
-      <qualifier name="DXFeatureLevel" value="DX9"/>
-      <qualifier name="Configuration" value=""/>
-      <qualifier name="DeviceFamily" value="Universal"/>
-      <qualifier name="Custom" value=""/>
-    </default>
-    <indexer-config type="folder" foldernameAsQualifier="true" filenameAsQualifier="true" qualifierDelimiter="."/>
-    <indexer-config type="resw" convertDotsToSlashes="true" initialPath=""/>
-    <indexer-config type="resjson" initialPath=""/>
-    <indexer-config type="PRI"/>
-  </index>
-</resources>
-'@
               $cfgPath = Join-Path $dir "priconfig.xml"
-              [IO.File]::WriteAllText($cfgPath, $pricfg, (New-Object Text.UTF8Encoding $false))
+              [IO.File]::WriteAllText($cfgPath, ($pricfgLines -join "`n"), (New-Object Text.UTF8Encoding $false))
               & $mp new /pr $dir /cf $cfgPath /mn (Join-Path $dir "AppxManifest.xml") /of (Join-Path $dir "resources.pri") /o | Out-Null
               if (-not (Test-Path (Join-Path $dir "resources.pri"))) { throw "pri failed for $($v.Label)" }
               $priPath = Join-Path $dir "resources.pri"
-              $priTxt = [Text.Encoding]::Unicode.GetString([IO.File]::ReadAllBytes($priPath))
+              $priBytes = [IO.File]::ReadAllBytes($priPath)
+              $priTxt = [Text.Encoding]::Unicode.GetString($priBytes)
               Note ("{0}: pri = {1} B  TargetSize={2}  Theme={3}  Scale={4}" -f $v.Label,
-                    (Get-Item $priPath).Length,
+                    $priBytes.Length,
                     $priTxt.Contains("TargetSize"),
                     $priTxt.Contains("Theme"),
                     $priTxt.Contains("Scale"))
@@ -194,7 +196,6 @@ jobs:
             Note ("{0}: files = {1}  icons = {2}" -f $v.Label, (Get-ChildItem $dir -Recurse -File).Count, (Get-ChildItem $ast -File).Count)
           }
 
-          # ---------- phase 2: loose zips (guaranteed, no signing needed) ----------
           Note ""
           Note "=== loose zips (primary, no certificate needed) ==="
           foreach ($v in $variants) {
@@ -203,7 +204,6 @@ jobs:
             Note ("{0}: loose = {1:N1} KB" -f $v.Label, ((Get-Item $zip).Length / 1KB))
           }
 
-          # ---------- phase 3: unsigned appx (for reference) ----------
           Note ""
           Note "=== unsigned appx ==="
           foreach ($v in $variants) {
@@ -213,10 +213,8 @@ jobs:
             else { Note ("{0}: appx FAILED" -f $v.Label) }
           }
 
-          # ---------- phase 4: self-sign (best effort, never fails the job) ----------
           Note ""
           Note "=== self-sign (best effort) ==="
-          $signErr = ""
           try {
             if (-not $st) { throw "signtool.exe not found under $sdk" }
             $pwPlain = "IconLab!" + [Guid]::NewGuid().ToString("N").Substring(0, 8)
@@ -237,15 +235,12 @@ jobs:
             }
             Remove-Item $pfxPath -Force -ErrorAction SilentlyContinue
           } catch {
-            $signErr = $_.Exception.Message
-            Note ("sign phase error: " + $signErr)
+            Note ("sign phase error: " + $_.Exception.Message)
           }
 
-          # ---------- phase 5: README ----------
           $readme = @(
             'ICON LAB',
             '',
-            'Three tiny standalone apps (different identities) so they can coexist:',
             '  A = full-bleed opaque icon, NO targetsize assets, no resources.pri',
             '  B = transparent + padded icon, NO targetsize assets, no resources.pri',
             '  C = full-bleed opaque icon + 42 targetsize assets + resources.pri (full qualifier set)',
@@ -267,7 +262,6 @@ jobs:
             '  Pin A, B, C to the taskbar and compare:',
             '    full bleed -> colour fills the whole square, edge to edge, no plate',
             '    plated     -> small shape centred on a coloured background plate',
-            '  Also check Start menu / All apps list and ALT+TAB.',
             '',
             '========== UNINSTALL ==========',
             '  Get-AppxPackage MagicMiku.IconLabA | Remove-AppxPackage',
