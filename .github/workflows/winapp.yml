@@ -165,14 +165,27 @@ jobs:
           $a = "$s\Assets"
           New-Item -ItemType Directory -Force -Path $a | Out-Null
           $ic = "$env:GITHUB_WORKSPACE\.github\store-icons"
-          $want = @("AppList.png","BadgeLogo.png","LargeTile.png","MediumTile.png","SmallTile.png","SplashScreen.png","Square150x150Logo.png","Square310x310Logo.png","Square44x44Logo.png","Square71x71Logo.png","StoreLogo.png","Wide310x150Logo.png","WideTile.png","AppList.targetsize-48_altform-unplated.png","AppList.targetsize-256_altform-unplated.png","AppList.targetsize-48_altform-lightunplated.png","AppList.targetsize-256_altform-lightunplated.png")
-          $ok = 0
-          foreach ($n in $want) {
-            $p = Join-Path $ic $n
-            if (Test-Path $p) { Copy-Item $p (Join-Path $a $n) -Force; $ok++ } else { Write-Host "  MISSING: $n" }
+          $zip = Join-Path $ic "appx-icons.zip"
+          if (Test-Path $zip) {
+            Expand-Archive -Path $zip -DestinationPath $a -Force
+            Write-Host "icons extracted from appx-icons.zip"
+          } else {
+            Get-ChildItem $ic -File -Filter *.png -ErrorAction SilentlyContinue |
+              ForEach-Object { Copy-Item $_.FullName (Join-Path $a $_.Name) -Force }
+            Write-Host "icons copied from individual png files"
           }
-          Write-Host "icons = $ok / 17"
-          if ($ok -lt 17) { throw "icons incomplete" }
+          $iconN = @(Get-ChildItem $a -Recurse -File -Force -ErrorAction SilentlyContinue).Count
+          Write-Host "icons = $iconN"
+          if ($iconN -lt 40) { throw "too few icons: $iconN (expected >=40)" }
+          $need = @("StoreLogo.png","Square44x44Logo.png","Square150x150Logo.png","Square310x310Logo.png","Square71x71Logo.png","Wide310x150Logo.png","SplashScreen.png","BadgeLogo.png","AppList.png")
+          foreach ($n in $need) { if (-not (Test-Path (Join-Path $a $n))) { throw "required icon missing: $n" } }
+          foreach ($t in @(16,20,24,30,32,36,40,48,60,64,72,80,96,256)) {
+            foreach ($suf in @("","_altform-unplated","_altform-lightunplated")) {
+              $fn = "AppList.targetsize-$t$suf.png"
+              if (-not (Test-Path (Join-Path $a $fn))) { throw "AppList targetsize asset missing: $fn" }
+            }
+          }
+          Write-Host "all required AppList targetsize assets present (14 sizes x 3 themes)"
           $pdn = [char]0xD835 + [char]0xDD78 + 'ik' + [char]0x0E19 + [char]0x795E + [char]0x6559 + [char]0x2728 + [char]0x6559 + [char]0x4E3B
           $x = @(
             '<?xml version="1.0" encoding="utf-8"?>'
@@ -222,13 +235,14 @@ jobs:
           & $mk pack /d $s /p "$out\b.appx" /o 2>&1 | Tee-Object b.log
           if (-not (Test-Path "$out\b.appx")) { Get-Content b.log | Select-Object -Last 8; throw "pack failed" }
           $mb = [math]::Round((Get-Item "$out\b.appx").Length/1MB,1)
-          Write-Host "*** OK $mb MB ver=$v ***"
+          Write-Host "*** OK $mb MB ver=$v icons=$iconN ***"
           if ($mb -lt 100) { throw "too small: $mb MB" }
           if (Test-Path "dist") { Remove-Item "dist" -Recurse -Force -ErrorAction SilentlyContinue }
           New-Item -ItemType Directory -Force -Path "dist" | Out-Null
           Copy-Item "$out\b.appx" "dist\bluefish.appx" -Force
           "ver=$v" | Out-File -Append $env:GITHUB_OUTPUT
           "mb=$mb" | Out-File -Append $env:GITHUB_OUTPUT
+          "icons=$iconN" | Out-File -Append $env:GITHUB_OUTPUT
       - name: Publish Release (latest)
         id: rel
         if: success()
@@ -245,7 +259,7 @@ jobs:
           gh release create $tag "dist\bluefish.appx" `
             --repo $repo `
             --title "蓝色大肥鱼 $v（最新）" `
-            --notes "版本: $v`nfrom: DeepSeek upstream`nbuild: ${{ github.run_number }}"
+            --notes "版本: $v`nicons: ${{ steps.pack.outputs.icons }}`nfrom: DeepSeek upstream`nbuild: ${{ github.run_number }}"
           if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
           $url = "https://github.com/$repo/releases/download/$tag/bluefish.appx"
           Write-Host "DIRECT URL = $url"
@@ -285,6 +299,7 @@ jobs:
             "",
             "版本: 1.0.${{ github.run_number }}.0",
             "大小: ${{ steps.pack.outputs.mb }} MB",
+            "图标: ${{ steps.pack.outputs.icons }} 个（含全部 targetsize 三主题）",
             "",
             "===== 第 1 步：下载 =====",
             "",
@@ -325,6 +340,7 @@ jobs:
             "  2. 下载中断或大小不符",
             "  3. 安装未完成",
             "  4. makeappx 打包失败",
+            "  5. 图标缺失（.github/store-icons/）",
             "",
             "查看日志:",
             $runUrl,
