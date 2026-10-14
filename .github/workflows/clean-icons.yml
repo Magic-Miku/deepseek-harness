@@ -1,0 +1,76 @@
+name: Clean Icons
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  clean:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete old icons (keep source.png only)
+        shell: bash
+        run: |
+          set -e
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+
+          cd "$GITHUB_WORKSPACE"
+          DIR=".github/store-icons"
+
+          echo "=== before ==="
+          ls -1 "$DIR" 2>/dev/null | head -20
+          echo "   ..."
+          echo "   total: $(ls -1 "$DIR" 2>/dev/null | wc -l) files"
+
+          deleted=0
+          for f in "$DIR"/*; do
+            [ -e "$f" ] || continue
+            base=$(basename "$f")
+            if [ "$base" != "source.png" ]; then
+              git rm -q "$f"
+              deleted=$((deleted+1))
+            fi
+          done
+          echo ""
+          echo "=== deleted: $deleted files ==="
+
+          if [ "$deleted" -gt 0 ]; then
+            git commit -q -m "chore: remove obsolete icons, keep source.png only"
+            git push origin HEAD:master
+            echo "pushed"
+          else
+            echo "nothing to delete"
+          fi
+
+          echo ""
+          echo "=== after ==="
+          ls -1 "$DIR" 2>/dev/null
+          echo "   total: $(ls -1 "$DIR" 2>/dev/null | wc -l) files"
+
+      - name: Delete this workflow file
+        if: always()
+        shell: bash
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE"
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+
+          # 先同步远端（上一步可能刚 push 过）
+          git fetch origin master --quiet
+          git reset --hard origin/master --quiet
+
+          if [ -f ".github/workflows/clean-icons.yml" ]; then
+            git rm -q .github/workflows/clean-icons.yml
+            git commit -q -m "chore: remove clean-icons workflow (one-shot done)"
+            git push origin HEAD:master
+            echo "workflow file removed"
+          else
+            echo "workflow file already gone"
+          fi
