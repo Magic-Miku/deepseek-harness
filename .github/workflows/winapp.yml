@@ -28,7 +28,7 @@ jobs:
           U="https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe"
           H=$(curl -sIL --max-time 60 --retry 3 "$U")
           LEN=$(echo "$H" | grep -i '^content-length:' | tail -1 | tr -d '\r' | awk '{print $2}')
-          ETAG=$(echo "$H" | grep -i '^etag:' | tail -1 | tr -d '\r' | sed 's/^[Ee][Tt][Aa][Gg]: *//')
+          ETAG=$(echo "$H" | grep -i '^etag:' | tail -1 | tr -d '\r' | sed 's/^[Ee][Tt][Aa][Gg]: *//' | tr -d '"')
           LM=$(echo "$H" | grep -i '^last-modified:' | tail -1 | tr -d '\r' | cut -d' ' -f2-)
           if [ -z "$LEN" ]; then
             echo "::error::无法获取上游 content-length"
@@ -40,7 +40,7 @@ jobs:
             N="$LEN|$LM"
           fi
           O=""
-          [ -f .dsh-hash ] && O=$(cat .dsh-hash | tr -d '\r\n')
+          [ -f .dsh-hash ] && O=$(cat .dsh-hash | tr -d '\r\n"')
           echo "current  = $N"
           echo "recorded = $O"
           if [ "${{ github.event.inputs.force }}" = "true" ] || [ "$N" != "$O" ]; then
@@ -60,10 +60,20 @@ jobs:
           TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           printf '%s | changed=%s | %s\n' "$TS" "${{ steps.c.outputs.changed }}" "${{ steps.c.outputs.hash }}" > .dsh-heartbeat
           git add .dsh-heartbeat
-          git diff --cached --quiet && echo "no change" && exit 0
+          if git diff --cached --quiet; then
+            echo "心跳无变化，跳过提交"
+            exit 0
+          fi
           git commit -m "chore: heartbeat [skip ci]"
-          git pull --rebase --autostash origin master || echo "rebase failed"
-          git push || echo "push failed"
+          if ! git pull --rebase --autostash origin master; then
+            echo "::warning::心跳 rebase 失败，本次跳过（不影响构建）"
+            exit 0
+          fi
+          if ! git push; then
+            echo "::warning::心跳推送失败。若连续 60 天无法提交，GitHub 会自动禁用本工作流，届时需手动启用。"
+            exit 0
+          fi
+          echo "心跳已提交"
       - name: Prune old artifacts
         if: always()
         continue-on-error: true
@@ -71,17 +81,34 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          echo "=== 当前 artifact ==="
-          gh api "repos/$REPO/actions/artifacts?per_page=100" --jq '.artifacts[] | "\(.id) \(.created_at) \(.name)"' > /tmp/arts.txt || true
-          COUNT=$(wc -l < /tmp/arts.txt)
-          echo "总数: $COUNT"
-          while read -r ID REST; do
+          # 先查总数，为 0 时直接跳过，避免无意义的逐条删除
+          TOTAL=$(gh api "repos/$REPO/actions/artifacts?per_page=1" --jq '.total_count' 2>/dev/null || echo "")
+          if [ -z "$TOTAL" ]; then
+            echo "::warning::无法查询 artifact 数量，跳过清理"
+            exit 0
+          fi
+          if [ "$TOTAL" = "0" ]; then
+            echo "当前无 artifact，无需清理"
+            exit 0
+          fi
+          echo "待清理 artifact: $TOTAL 个"
+          gh api "repos/$REPO/actions/artifacts?per_page=100" --jq '.artifacts[] | .id' > /tmp/ids.txt || true
+          OK=0
+          FAIL=0
+          while read -r ID; do
             [ -z "$ID" ] && continue
-            echo "删除 artifact $ID"
-            gh api -X DELETE "repos/$REPO/actions/artifacts/$ID" || true
-          done < /tmp/arts.txt
-          echo "=== 清理后 ==="
-          gh api "repos/$REPO/actions/artifacts?per_page=100" --jq '"剩余 \(.total_count) 个"' || true
+            if gh api -X DELETE "repos/$REPO/actions/artifacts/$ID" 2>/dev/null; then
+              OK=$((OK+1))
+            else
+              FAIL=$((FAIL+1))
+            fi
+          done < /tmp/ids.txt
+          echo "已删除 $OK 个，失败 $FAIL 个"
+          if [ "$FAIL" -gt 0 ]; then
+            echo "::warning::有 $FAIL 个 artifact 删除失败（可能是权限或已被删除），不影响构建"
+          fi
+          REMAIN=$(gh api "repos/$REPO/actions/artifacts?per_page=1" --jq '.total_count' 2>/dev/null || echo "?")
+          echo "剩余: $REMAIN"
   build:
     needs: [check]
     if: needs.check.outputs.changed == 'true'
@@ -107,6 +134,7 @@ jobs:
           if ($sz -ne $want) { throw "size mismatch: got $sz, expected $want" }
           Write-Host "download OK"
       - name: Silent install
+        id: inst
         run: |
           $f = "$env:RUNNER_TEMP\dsh-setup.exe"
           $t = "C:\A"
@@ -141,6 +169,46 @@ jobs:
           if (-not $exe) { throw "DeepSeek Harness.exe not found after install" }
           if ($final.Count -lt 9000) { throw "too few files: $($final.Count) (expected ~9700)" }
           Write-Host "install OK: $($exe.FullName)"
+
+          # 只读：从 resources/app.asar 读取真实应用版本号与构建 commit
+          # 注意：安装目录下的 version 文件是 Electron 版本（如 44.0.0），不是应用版本
+          $appVer = "unknown"
+          $buildCommit = ""
+          $asar = "$t\resources\app.asar"
+          if (Test-Path $asar) {
+            try {
+              $fsx = [System.IO.File]::OpenRead($asar)
+              try {
+                $br = New-Object System.IO.BinaryReader($fsx)
+                $null = $br.ReadUInt32()
+                $headerSize = $br.ReadUInt32()
+                $null = $br.ReadUInt32()
+                $jsonLen = $br.ReadUInt32()
+                if ($jsonLen -gt 0 -and $jsonLen -lt 64MB) {
+                  $jsonTxt = [System.Text.Encoding]::UTF8.GetString($br.ReadBytes([int]$jsonLen))
+                  $hdr = $jsonTxt | ConvertFrom-Json
+                  $base = 8 + [int]$headerSize
+                  $dataStart = $base + ((4 - ($base % 4)) % 4)
+                  $entry = $hdr.files.'package.json'
+                  if ($entry) {
+                    $fsx.Position = [int64]$dataStart + [int64]$entry.offset
+                    $pkgTxt = [System.Text.Encoding]::UTF8.GetString($br.ReadBytes([int]$entry.size))
+                    $pkg = $pkgTxt | ConvertFrom-Json
+                    if ($pkg.version) { $appVer = [string]$pkg.version }
+                    if ($pkg.dshBuildCommit) { $buildCommit = [string]$pkg.dshBuildCommit }
+                  }
+                }
+              } finally { $fsx.Dispose() }
+            } catch {
+              Write-Host "::warning::读取 app.asar 失败: $($_.Exception.Message)"
+            }
+          } else {
+            Write-Host "::warning::未找到 resources\app.asar"
+          }
+          if ($buildCommit.Length -gt 12) { $buildCommit = $buildCommit.Substring(0, 12) }
+          Write-Host "app version = $appVer   build commit = $buildCommit"
+          "appver=$appVer" | Out-File -Append $env:GITHUB_OUTPUT
+          "commit=$buildCommit" | Out-File -Append $env:GITHUB_OUTPUT
       - name: Pack
         id: pack
         run: |
@@ -168,11 +236,18 @@ jobs:
           $a = "$s\Assets"
           New-Item -ItemType Directory -Force -Path $a | Out-Null
           $srcIcon = "$env:GITHUB_WORKSPACE\.github\store-icons\source.png"
-          if (Test-Path $srcIcon) {
-            Write-Host "generating icons from source.png"
-            Add-Type -AssemblyName System.Drawing
+          if (-not (Test-Path $srcIcon)) {
+            throw "source.png 不存在: $srcIcon —— 请在 .github/store-icons/ 下放置一张 1024x1024 的 source.png"
+          }
+          Write-Host "generating icons from source.png"
+          Add-Type -AssemblyName System.Drawing
+          $srcImg = $null
+          try {
             $srcImg = [System.Drawing.Image]::FromFile($srcIcon)
             Write-Host ("source: {0}x{1}" -f $srcImg.Width, $srcImg.Height)
+            if ($srcImg.Width -lt 256 -or $srcImg.Height -lt 256) {
+              Write-Host "::warning::source.png 小于 256px，生成的图标可能模糊"
+            }
             function New-Icon([string]$Path, [int]$W, [int]$H) {
               $bmp = New-Object System.Drawing.Bitmap($W, $H)
               $g = [System.Drawing.Graphics]::FromImage($bmp)
@@ -204,9 +279,8 @@ jobs:
                 New-Icon (Join-Path $a ("Square44x44Logo.targetsize-$t$suf.png")) $t $t
               }
             }
-            $srcImg.Dispose()
-          } else {
-            throw "source.png not found at $srcIcon"
+          } finally {
+            if ($srcImg) { $srcImg.Dispose() }
           }
 
           $iconN = @(Get-ChildItem $a -Recurse -File -Force -ErrorAction SilentlyContinue).Count
@@ -305,21 +379,27 @@ jobs:
               '</resources>'
             )
             $cfgPath = "$s\priconfig.xml"
-            [IO.File]::WriteAllText($cfgPath, ($pricfgLines -join "`n"), (New-Object Text.UTF8Encoding $false))
-            $priPath = "$s\resources.pri"
-            $priLog = & $mp new /pr $s /cf $cfgPath /mn "$s\AppxManifest.xml" /of $priPath /o 2>&1 | Out-String
-            $cand = ($priLog -split "`n" | Where-Object { $_ -match "Resource Candidates" } | ForEach-Object { $_.Trim() }) -join " "
-            Write-Host "makepri: $cand"
-            if (-not (Test-Path $priPath)) {
-              Write-Host "WARNING: resources.pri NOT created"
-              $priLog -split "`n" | ForEach-Object { if ($_.Trim()) { Write-Host "   " + $_.Trim() } }
-            } else {
-              $priOk = $true
-              Write-Host "resources.pri = $((Get-Item $priPath).Length) bytes"
+            try {
+              [IO.File]::WriteAllText($cfgPath, ($pricfgLines -join "`n"), (New-Object Text.UTF8Encoding $false))
+              $priPath = "$s\resources.pri"
+              $priLog = & $mp new /pr $s /cf $cfgPath /mn "$s\AppxManifest.xml" /of $priPath /o 2>&1 | Out-String
+              $cand = ($priLog -split "`n" | Where-Object { $_ -match "Resource Candidates" } | ForEach-Object { $_.Trim() }) -join " "
+              Write-Host "makepri: $cand"
+              if (-not (Test-Path $priPath)) {
+                Write-Host "::warning::resources.pri 未生成，任务栏图标可能仍有底板"
+                $priLog -split "`n" | ForEach-Object { if ($_.Trim()) { Write-Host "   " + $_.Trim() } }
+              } else {
+                $priOk = $true
+                Write-Host "resources.pri = $((Get-Item $priPath).Length) bytes"
+              }
+            } finally {
               Remove-Item $cfgPath -Force -ErrorAction SilentlyContinue
             }
           } else {
-            Write-Host "WARNING: makepri.exe not found"
+            Write-Host "::warning::未找到 makepri.exe，跳过 resources.pri 生成"
+          }
+          if (-not $priOk) {
+            Write-Host "::warning::pri=False —— 图标可能显示底板，但仍会继续构建"
           }
           Write-Host "=== pri=$priOk ==="
 
@@ -327,7 +407,11 @@ jobs:
           if (Test-Path $out) { Remove-Item $out -Recurse -Force -ErrorAction SilentlyContinue }
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           & $mk pack /d $s /p "$out\b.appx" /o 2>&1 | Tee-Object b.log
-          if (-not (Test-Path "$out\b.appx")) { Get-Content b.log | Select-Object -Last 8; throw "pack failed" }
+          if (-not (Test-Path "$out\b.appx")) {
+            Write-Host "=== makeappx 输出尾部 ==="
+            Get-Content b.log | Select-Object -Last 15 | ForEach-Object { Write-Host "   $_" }
+            throw "pack failed"
+          }
           $mb = [math]::Round((Get-Item "$out\b.appx").Length/1MB,1)
           Write-Host "*** OK $mb MB ver=$v icons=$iconN pri=$priOk ***"
           if ($mb -lt 100) { throw "too small: $mb MB" }
@@ -354,7 +438,7 @@ jobs:
           gh release create $tag "dist\bluefish.appx" `
             --repo $repo `
             --title "蓝色大肥鱼 $v（最新）" `
-            --notes "版本: $v`nicons: ${{ steps.pack.outputs.icons }}`npri: ${{ steps.pack.outputs.pri }}`nfrom: DeepSeek upstream`nbuild: ${{ github.run_number }}"
+            --notes "版本: $v`n应用内部版本: ${{ steps.inst.outputs.appver }}`n上游构建: ${{ steps.inst.outputs.commit }}`nicons: ${{ steps.pack.outputs.icons }}`npri: ${{ steps.pack.outputs.pri }}`nfrom: DeepSeek upstream`nbuild: ${{ github.run_number }}"
           if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
           $url = "https://github.com/$repo/releases/download/$tag/bluefish.appx"
           Write-Host "DIRECT URL = $url"
@@ -376,23 +460,36 @@ jobs:
           git config user.email "bot@users.noreply.github.com"
           echo "${{ needs.check.outputs.hash }}" > .dsh-hash
           git add .dsh-hash
-          git diff --cached --quiet && echo "hash unchanged" && exit 0
+          if git diff --cached --quiet; then
+            echo "指纹无变化"
+            exit 0
+          fi
           git commit -m "hash [skip ci]"
-          git pull --rebase --autostash origin master || echo "rebase failed"
-          git push || echo "push failed"
+          if ! git pull --rebase --autostash origin master; then
+            echo "::warning::指纹 rebase 失败，本次跳过（下次运行会重试）"
+            exit 0
+          fi
+          if ! git push; then
+            echo "::warning::指纹推送失败（不影响已发布的包，下次运行会重试）"
+            exit 0
+          fi
+          echo "指纹已保存"
       - name: Email success
         if: success()
         shell: pwsh
+        continue-on-error: true
         run: |
           $url = "${{ steps.rel.outputs.url }}"
           $runUrl = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           if (-not $url) {
-            $url = "(Release 未生成，请到 Actions 页下载 artifact)`n$runUrl"
+            $url = "(Release 未生成 —— 请打开下方链接，在 Artifacts 区域下载 dsh-msix)"
           }
           $L = @(
             "DeepSeek Harness 新包已构建完成。",
             "",
-            "版本: 1.0.${{ github.run_number }}.0",
+            "包版本: 1.0.${{ github.run_number }}.0",
+            "应用内部版本: ${{ steps.inst.outputs.appver }}",
+            "上游构建: ${{ steps.inst.outputs.commit }}",
             "大小: ${{ steps.pack.outputs.mb }} MB",
             "图标: ${{ steps.pack.outputs.icons }} 个（source.png 现生成）",
             "resources.pri: ${{ steps.pack.outputs.pri }}",
@@ -402,6 +499,9 @@ jobs:
             "点这个链接（浏览器立即开始下载，永远是最新版）：",
             "",
             $url,
+            "",
+            "如果上面的链接点不开，打开这里手动下载：",
+            $runUrl,
             "",
             "===== 第 2 步：上传商店 =====",
             "",
@@ -423,20 +523,26 @@ jobs:
       - name: Email failure
         if: failure()
         shell: pwsh
+        continue-on-error: true
         run: |
           $runUrl = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           $L = @(
             "DSH 自动构建失败了，需要你检查一下。",
             "",
-            "版本: 1.0.${{ github.run_number }}.0",
+            "包版本: 1.0.${{ github.run_number }}.0",
             "上游指纹: ${{ needs.check.outputs.hash }}",
             "",
+            "怎么重试：",
+            "  1. 打开下面的日志链接",
+            "  2. 点右上角【Re-run all jobs】按钮",
+            "  3. 如果还是失败，把日志发给助手",
+            "",
             "常见原因:",
-            "  1. DeepSeek 改了安装包结构",
-            "  2. 下载中断或大小不符",
-            "  3. 安装未完成",
+            "  1. DeepSeek 改了安装包结构（下载校验不通过）",
+            "  2. 网络中断导致下载不完整",
+            "  3. 安装未完成（文件数不足）",
             "  4. makeappx 打包失败",
-            "  5. 图标生成失败（source.png 缺失或损坏）",
+            "  5. source.png 缺失或损坏",
             "",
             "查看日志:",
             $runUrl,
