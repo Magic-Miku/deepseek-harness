@@ -263,7 +263,21 @@ jobs:
           Add-Type -AssemblyName System.Drawing
           $srcImg = $null
           try {
-            $srcImg = [System.Drawing.Image]::FromFile($srcIcon)
+            # .NET 对损坏/非图片文件会抛 OutOfMemoryException（信息误导），
+            # 这里换算成可读原因，避免误判为 runner 内存不足。
+            try {
+              $srcImg = [System.Drawing.Image]::FromFile($srcIcon)
+            } catch {
+              $fi = Get-Item $srcIcon -ErrorAction SilentlyContinue
+              $head = ""
+              try {
+                $raw = [IO.File]::ReadAllBytes($srcIcon)
+                $head = (($raw[0..([Math]::Min(11, $raw.Length-1))] | ForEach-Object { $_.ToString("X2") }) -join " ")
+              } catch { }
+              throw ("source.png 无法作为图片打开（文件可能损坏或不是图片格式）。大小=" +
+                     $(if ($fi) { $fi.Length } else { "?" }) + " 字节，文件头=" + $head +
+                     "，原始错误=" + $_.Exception.Message)
+            }
             Write-Host ("source: {0}x{1}" -f $srcImg.Width, $srcImg.Height)
             if ($srcImg.Width -lt 256 -or $srcImg.Height -lt 256) {
               Write-Host "::warning::source.png 小于 256px，生成的图标可能模糊"
@@ -558,13 +572,34 @@ jobs:
             "-- GitHub Actions 自动发送"
           )
           $body = $L -join "`r`n"
-          $sec = ConvertTo-SecureString "${{ secrets.QQ_AUTH_CODE }}" -AsPlainText -Force
-          $cred = New-Object System.Management.Automation.PSCredential("${{ secrets.QQ_EMAIL }}", $sec)
-          Send-MailMessage -SmtpServer "smtp.qq.com" -Port 587 -UseSsl -From "${{ secrets.QQ_EMAIL }}" -To "${{ secrets.QQ_EMAIL }}" -Subject "[DSH] 新版本已就绪，可以发布到商店了" -Body $body -Encoding UTF8 -Credential $cred
-          Write-Host "success mail sent"
-      - name: Email failure
-        if: failure()
+          # 邮件失败不应让整个 job 变红（构建本身是成功的），
+          # 但也不能静默：用 try/catch + 注解把结果暴露出来，
+          # 这样“没收到邮件”时能在 Annotations 里查到确切原因。
+          # 注意：Send-MailMessage 抛的是非终止性错误，必须加 -ErrorAction Stop 才能进 catch。
+          try {
+            $sec = ConvertTo-SecureString "${{ secrets.QQ_AUTH_CODE }}" -AsPlainText -Force
+            $cred = New-Object System.Management.Automation.PSCredential("${{ secrets.QQ_EMAIL }}", $sec)
+            Send-MailMessage -SmtpServer "smtp.qq.com" -Port 587 -UseSsl -From "${{ secrets.QQ_EMAIL }}" -To "${{ secrets.QQ_EMAIL }}" -Subject "[DSH] 新版本已就绪，可以发布到商店了" -Body $body -Encoding UTF8 -Credential $cred -ErrorAction Stop
+            Write-Host "::notice title=Mail-OK::成功邮件已发送到 ${{ secrets.QQ_EMAIL }}"
+          } catch {
+            Write-Host "::warning title=Mail-FAILED::成功邮件发送失败（构建与发布正常，请照常下载）。原因: $($_.Exception.Message) —— 通常是 QQ_AUTH_CODE 过期，请到 QQ 邮箱重新生成授权码并更新 Secret。"
+          }
+  # 失败通知独立成 job：
+  # 原来 Email failure 在 build 内，而 build 依赖 check；
+  # 一旦 check 本身失败（上游取不到 content-length），build 会被跳过，
+  # 失败邮件永远不会发出，你只会看到 Actions 页面变红。
+  # 用 windows-2025 而非 ubuntu：Send-MailMessage 已在 windows 上实测成功，
+  # 公开仓库的 Windows 分钟数同样免费，避免 Linux 上的平台兼容风险。
+  notify:
+    needs: [check, build]
+    if: failure()
+    runs-on: windows-2025
+    timeout-minutes: 10
+    defaults:
+      run:
         shell: pwsh
+    steps:
+      - name: Email failure
         continue-on-error: true
         run: |
           $runUrl = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
@@ -573,6 +608,8 @@ jobs:
             "",
             "包版本: 1.0.${{ github.run_number }}.0",
             "上游指纹: ${{ needs.check.outputs.hash }}",
+            "check 结果: ${{ needs.check.result }}",
+            "build 结果: ${{ needs.build.result }}",
             "",
             "怎么重试：",
             "  1. 打开下面的日志链接",
@@ -580,8 +617,8 @@ jobs:
             "  3. 如果还是失败，把日志发给助手",
             "",
             "常见原因:",
-            "  1. DeepSeek 改了安装包结构（下载校验不通过）",
-            "  2. 网络中断导致下载不完整",
+            "  1. 上游地址取不到文件信息（check 阶段失败，通常是 DeepSeek 改了地址或临时故障）",
+            "  2. 下载中断导致文件不完整",
             "  3. 安装未完成（文件数不足）",
             "  4. makeappx 打包失败",
             "  5. source.png 缺失或损坏",
@@ -592,7 +629,12 @@ jobs:
             "-- GitHub Actions 自动发送"
           )
           $body = $L -join "`r`n"
-          $sec = ConvertTo-SecureString "${{ secrets.QQ_AUTH_CODE }}" -AsPlainText -Force
-          $cred = New-Object System.Management.Automation.PSCredential("${{ secrets.QQ_EMAIL }}", $sec)
-          Send-MailMessage -SmtpServer "smtp.qq.com" -Port 587 -UseSsl -From "${{ secrets.QQ_EMAIL }}" -To "${{ secrets.QQ_EMAIL }}" -Subject "[DSH] 构建失败，需要检查" -Body $body -Encoding UTF8 -Credential $cred
-          Write-Host "failure mail sent"
+          # 同 Email success：失败也不能静默，用注解暴露真实原因。
+          try {
+            $sec = ConvertTo-SecureString "${{ secrets.QQ_AUTH_CODE }}" -AsPlainText -Force
+            $cred = New-Object System.Management.Automation.PSCredential("${{ secrets.QQ_EMAIL }}", $sec)
+            Send-MailMessage -SmtpServer "smtp.qq.com" -Port 587 -UseSsl -From "${{ secrets.QQ_EMAIL }}" -To "${{ secrets.QQ_EMAIL }}" -Subject "[DSH] 构建失败，需要检查" -Body $body -Encoding UTF8 -Credential $cred -ErrorAction Stop
+            Write-Host "::notice title=Mail-OK::失败通知邮件已发送到 ${{ secrets.QQ_EMAIL }}"
+          } catch {
+            Write-Host "::warning title=Mail-FAILED::失败通知邮件也没发出去。原因: $($_.Exception.Message) —— 通常是 QQ_AUTH_CODE 过期。请直接打开上面的日志链接查看。"
+          }
